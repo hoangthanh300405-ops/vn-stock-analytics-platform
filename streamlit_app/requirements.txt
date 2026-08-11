@@ -1,0 +1,7 @@
+streamlit>=1.38
+duckdb>=1.0
+pandas
+plotly
+streamlit-authenticator>=0.4
+psycopg2-binary>=2.9
+requests

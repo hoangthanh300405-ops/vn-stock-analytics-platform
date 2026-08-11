@@ -1,0 +1,50 @@
+version: 2
+
+models:
+  - name: dim_stock
+    description: Dimension mã cổ phiếu — 1 dòng / 1 mã, sàn, ngành
+    columns:
+      - name: stock_key
+        description: Khoá chính, trùng với symbol
+        tests:
+          - unique
+          - not_null
+      - name: symbol
+        tests:
+          - not_null
+
+  - name: dim_sector
+    description: Dimension ngành — danh sách ngành duy nhất
+    columns:
+      - name: sector_key
+        tests:
+          - unique
+          - not_null
+
+  - name: dim_date
+    description: Dimension ngày, phủ 2020-2030
+    columns:
+      - name: date_key
+        tests:
+          - unique
+          - not_null
+
+  - name: fct_price_daily
+    description: Fact giá + khối lượng theo mã-ngày, incremental
+    columns:
+      - name: symbol
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_stock')
+              field: symbol
+      - name: date_key
+        tests:
+          - not_null
+      - name: close_price
+        tests:
+          - not_null
+      - name: volume
+        description: Khối lượng giao dịch, không được âm
+        tests:
+          - not_null

@@ -1,0 +1,14 @@
+# profiles.yml mẫu — copy vào ~/.dbt/profiles.yml
+# Yêu cầu: pip install dbt-duckdb
+# Đã đổi kiến trúc: dbt chạy trực tiếp trên file vnstock.duckdb (local/CI),
+# KHÔNG còn qua MotherDuck -> không cần token nào ở bước này nữa.
+vnstock:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      # DUCKDB_FILE_PATH cho phép CI dùng đường dẫn tuyệt đối; mặc định
+      # "vnstock.duckdb" (thư mục hiện tại) khi chạy local không set biến này.
+      path: "{{ env_var('DUCKDB_FILE_PATH', 'vnstock.duckdb') }}"
+      schema: main
+      threads: 4

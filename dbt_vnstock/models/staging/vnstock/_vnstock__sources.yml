@@ -1,0 +1,14 @@
+version: 2
+
+sources:
+  - name: vnstock_raw
+    database: vnstock_db
+    schema: raw
+    description: Dữ liệu thô do load_to_motherduck.py nạp vào, chưa qua transform
+    tables:
+      - name: dim_stock
+        description: Danh mục mã cổ phiếu, sàn, ngành (full refresh mỗi ngày)
+      - name: fact_price_daily
+        description: Giá OHLCV + khối lượng theo mã-ngày (append incremental mỗi ngày)
+      - name: company_profile
+        description: Thông tin công ty phát hành (ngành nghề, vốn điều lệ, ngày niêm yết...) — full refresh hàng tuần

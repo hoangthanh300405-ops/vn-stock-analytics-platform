@@ -1,0 +1,92 @@
+name: Daily VN Stock ETL
+
+on:
+  schedule:
+    # 15:45 giờ Việt Nam (UTC+7) = 08:45 UTC, chỉ thứ 2-6 (thị trường không giao dịch cuối tuần)
+    - cron: "45 8 * * 1-5"
+  workflow_dispatch: {}  # cho phép trigger thủ công để test
+
+# Chỉ 1 job được chạy tại 1 thời điểm — job daily và job weekly (company profile)
+# đều đọc/ghi cùng 1 file vnstock.duckdb qua GitHub Release, chạy đè lên nhau
+# cùng lúc sẽ làm hỏng file.
+concurrency:
+  group: vnstock-data-release
+  cancel-in-progress: false
+
+jobs:
+  etl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60  # ~1600 mã x throttle delay có thể mất 20-30 phút, để dư biên an toàn
+
+    env:
+      DUCKDB_FILE_PATH: ${{ github.workspace }}/vnstock.duckdb
+      GH_TOKEN: ${{ github.token }}  # dùng cho lệnh gh release, không cần secret riêng
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        # Fix #4: cài đúng version pin trong requirements.txt, KHÔNG dùng "-U"
+        run: pip install -r requirements.txt dbt-duckdb
+
+      - name: Đảm bảo GitHub Release "latest-data" tồn tại
+        run: |
+          gh release view latest-data || gh release create latest-data \
+            --title "Latest vnstock data" \
+            --notes "File .duckdb tự động cập nhật bởi daily_etl.yml — đừng sửa tay."
+
+      - name: Tải file .duckdb của lần chạy trước (nếu có)
+        run: |
+          gh release download latest-data --pattern "vnstock.duckdb" \
+            --dir "${{ github.workspace }}" --clobber \
+            || echo "Chưa có file trước đó, sẽ tạo mới ở bước Load."
+
+      - name: Extract từ vnstock
+        env:
+          VNSTOCK_API_KEY: ${{ secrets.VNSTOCK_API_KEY }}
+        run: python extract_vnstock.py
+
+      - name: Load vào file DuckDB
+        run: python build_duckdb_file.py
+
+      - name: Cấu hình dbt profile
+        run: |
+          mkdir -p ~/.dbt
+          cp dbt_vnstock/profiles.yml ~/.dbt/profiles.yml
+
+      - name: dbt seed (nạp bảng ngày nghỉ lễ VN)
+        working-directory: dbt_vnstock
+        run: dbt seed
+
+      - name: dbt run (transform raw -> star schema)
+        working-directory: dbt_vnstock
+        run: dbt run
+
+      - name: dbt test (data quality gate)
+        working-directory: dbt_vnstock
+        run: dbt test
+
+      - name: Upload file .duckdb mới lên GitHub Release
+        if: success()  # chỉ publish file mới nếu dbt test pass, không phát tán dữ liệu lỗi
+        run: gh release upload latest-data "${{ github.workspace }}/vnstock.duckdb" --clobber
+
+      - name: Upload CSV làm artifact (debug khi cần)
+        if: always()  # lưu lại kể cả khi bước trước fail, để xem CSV sinh ra bị gì
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-datasets-${{ github.run_number }}
+          path: |
+            dim_stock.csv
+            fact_price_daily.csv
+          retention-days: 7
+
+      - name: Thông báo khi job fail
+        if: failure()
+        run: echo "::error::ETL job thất bại ở run #${{ github.run_number }} - kiểm tra log ở bước Extract/Load phía trên"

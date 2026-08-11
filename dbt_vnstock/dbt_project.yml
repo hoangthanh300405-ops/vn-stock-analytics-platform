@@ -1,0 +1,17 @@
+name: "vnstock_dw"
+version: "1.0.0"
+config-version: 2
+
+profile: "vnstock"
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+
+models:
+  vnstock_dw:
+    staging:
+      +materialized: view
+      +schema: staging
+    marts:
+      core:
+        +materialized: table
