@@ -23,7 +23,7 @@ import requests
 # ── Phần 1: Phân tích - file DuckDB tĩnh ──────────────────────────────────
 
 # Đổi <user>/<repo> thành đúng GitHub repo của bạn
-DUCKDB_ASSET_URL = "https://github.com/<user>/<repo>/releases/download/latest-data/vnstock.duckdb"
+DUCKDB_ASSET_URL = "https://github.com/hoangthanh300405-ops/vn-stock-analytics-platform/releases/download/latest-data/vnstock.duckdb"
 LOCAL_DUCKDB_PATH = "/tmp/vnstock.duckdb"
 
 
