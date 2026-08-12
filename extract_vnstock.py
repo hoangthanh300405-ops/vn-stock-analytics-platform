@@ -4,41 +4,69 @@ extract_vnstock.py
 Giai đoạn 1 (Extract) trong pipeline: gọi API vnstock, ghi ra các file CSV
 trung gian mà build_duckdb_file.py (giai đoạn 2 - Load) sẽ đọc vào.
 
-File này hiện mới có phần lấy DANH MỤC MÃ (dim_stock.csv). Phần lấy giá
-OHLCV (fact_price_daily.csv) và thông tin công ty (company_profile.csv)
-sẽ bổ sung sau — main() dưới đây tạm thời chỉ chạy phần dim_stock.
+File này có 2 phần:
+  1. dim_stock.csv       - danh mục mã (symbol, organ_name, exchange, industry)
+  2. fact_price_daily.csv - giá OHLCV theo mã-ngày, chạy sau khi có dim_stock
+                            (cần danh sách mã từ bước 1 để lặp qua từng mã)
 
-Nguồn dữ liệu: class Listing của vnstock (nguồn VCI, mặc định của v4.0.5).
-Đối chiếu trực tiếp với source code vnstock/explorer/vci/listing.py để đảm
-bảo đúng tên cột thật (KHÔNG dùng tên cột đoán từ tài liệu cũ):
+company_profile.csv (thông tin công ty, chạy hàng tuần) CHƯA có trong file
+này — build_duckdb_file.py đã tự bỏ qua nếu thiếu file này (xem
+load_company_profile()), nên không chặn pipeline hàng ngày.
+
+Nguồn dữ liệu: vnstock v4.0.5, nguồn VCI. Đối chiếu trực tiếp với source code
+vnstock/explorer/vci/listing.py và vnstock/explorer/vci/quote.py để đảm bảo
+đúng tên hàm/tên cột thật (KHÔNG dùng tên cột đoán từ tài liệu cũ):
 
   - Listing().symbols_by_exchange()
       -> 1 dòng / 1 mã, cột: symbol, exchange, type, organ_name, organ_short_name
-      -> dùng để lấy exchange + organ_name (tên công ty)
 
   - Listing().symbols_by_industries()
       -> DẠNG DÀI: 1 mã có thể có tới 4 dòng (icb_level 1..4, từ ngành lớn
          (VD "Tài chính") tới ngành nhỏ (VD "Ngân hàng thương mại")).
-      -> dùng để lấy industry. Ta chọn icb_level=2 làm "industry" hiển thị
-         trên dashboard (đủ chi tiết để so sánh ngành mà không quá vụn).
+      -> Ta chọn icb_level=2 làm "industry" hiển thị trên dashboard.
          Đổi ICB_LEVEL_FOR_INDUSTRY bên dưới nếu muốn cấp khác.
+
+  - Quote(symbol=<mã>, source="VCI").history(start=..., end=..., interval="1D")
+      -> 1 dòng / 1 ngày giao dịch của ĐÚNG 1 mã, cột: time, open, high, low,
+         close, volume (KHÔNG có sẵn cột symbol -> phải tự thêm vào).
+      -> Gọi lặp qua TỪNG mã (API không có endpoint lấy nhiều mã 1 lần), nên
+         cần throttle (nghỉ giữa các lần gọi) để tránh bị chặn IP/rate-limit.
 
 Yêu cầu: pip install vnstock==4.0.5 pandas tenacity (đã pin trong requirements.txt)
 """
 
 import logging
+import time
+from datetime import date, timedelta
 
 import pandas as pd
 from tenacity import retry, stop_after_attempt, wait_exponential
 from vnstock.explorer.vci.listing import Listing
+from vnstock.explorer.vci.quote import Quote
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 DIM_STOCK_CSV = "dim_stock.csv"
+FACT_PRICE_CSV = "fact_price_daily.csv"
 
 # Cấp ICB dùng làm cột "industry" — xem giải thích ở docstring phía trên.
 ICB_LEVEL_FOR_INDUSTRY = 2
+
+# Số ngày lấy lùi về trước mỗi lần chạy. Đặt dư ra (không chỉ lấy 1 ngày hôm
+# qua) để tự vá những ngày bị miss do lần chạy trước lỗi/API tạm thời không
+# có dữ liệu — trùng lặp với dữ liệu cũ sẽ được dbt dedup ở bước staging
+# (ROW_NUMBER theo symbol+trade_date, xem stg_vnstock__fact_price_daily.sql).
+LOOKBACK_DAYS = 10
+
+# Nghỉ giữa mỗi lần gọi API cho 1 mã, để không bị VCI chặn vì gọi quá dồn dập.
+# Với ~1700 mã: 1700 * 0.3s ≈ 8.5 phút, cộng thời gian mạng thực tế mỗi call
+# -> nằm trong ngân sách 20-30 phút đã tính trong daily_etl.yml.
+THROTTLE_SECONDS = 0.3
+
+# Số mã lỗi tối đa được phép bỏ qua trước khi coi là API đang có sự cố diện
+# rộng và dừng hẳn (tránh ghi ra 1 file gần như rỗng mà không ai biết).
+MAX_FAILED_SYMBOLS_RATIO = 0.2
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=20))
@@ -101,6 +129,67 @@ def build_dim_stock() -> pd.DataFrame:
     return dim_stock
 
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=15))
+def _fetch_ohlcv_one_symbol(symbol: str, start: str, end: str) -> pd.DataFrame:
+    """Lấy giá OHLCV cho ĐÚNG 1 mã. Retry 3 lần vì API hay timeout/lỗi mạng tạm thời."""
+    df = Quote(symbol=symbol, source="VCI").history(start=start, end=end, interval="1D")
+    return df
+
+
+def build_fact_price_daily(symbols: list[str]) -> pd.DataFrame:
+    """
+    Lặp qua từng mã trong `symbols`, gọi Quote.history(), gộp lại thành 1 bảng
+    fact_price_daily: cột symbol, time, open, high, low, close, volume.
+    """
+    end_date = date.today()
+    start_date = end_date - timedelta(days=LOOKBACK_DAYS)
+    start_str = start_date.isoformat()
+    end_str = end_date.isoformat()
+
+    log.info(
+        f"Lấy giá OHLCV cho {len(symbols)} mã, khoảng {start_str} -> {end_str} "
+        f"(lookback {LOOKBACK_DAYS} ngày)..."
+    )
+
+    all_frames = []
+    failed_symbols = []
+
+    for i, symbol in enumerate(symbols, start=1):
+        try:
+            df = _fetch_ohlcv_one_symbol(symbol, start_str, end_str)
+            if df is not None and len(df) > 0:
+                df = df.copy()
+                df["symbol"] = symbol
+                all_frames.append(df)
+        except Exception as e:
+            # Không để 1 mã lỗi (VD mã đã huỷ niêm yết, mã mới chưa có giá)
+            # làm chết cả job — log lại và đi tiếp, tổng hợp cảnh báo ở cuối.
+            failed_symbols.append(symbol)
+            log.warning(f"[{i}/{len(symbols)}] Lỗi khi lấy giá {symbol}: {e}")
+
+        if i % 100 == 0:
+            log.info(f"Tiến độ: {i}/{len(symbols)} mã đã xử lý...")
+
+        time.sleep(THROTTLE_SECONDS)
+
+    fail_ratio = len(failed_symbols) / len(symbols) if symbols else 0
+    if fail_ratio > MAX_FAILED_SYMBOLS_RATIO:
+        raise RuntimeError(
+            f"{len(failed_symbols)}/{len(symbols)} mã ({fail_ratio:.0%}) lấy giá thất bại "
+            f"— vượt ngưỡng {MAX_FAILED_SYMBOLS_RATIO:.0%}, nghi ngờ API đang lỗi diện rộng. "
+            "Dừng lại, không ghi file dữ liệu thiếu sót."
+        )
+    if failed_symbols:
+        log.warning(f"Có {len(failed_symbols)} mã lấy giá thất bại (đã bỏ qua): {failed_symbols}")
+
+    if not all_frames:
+        return pd.DataFrame(columns=["symbol", "time", "open", "high", "low", "close", "volume"])
+
+    fact_price_daily = pd.concat(all_frames, ignore_index=True)
+    fact_price_daily = fact_price_daily[["symbol", "time", "open", "high", "low", "close", "volume"]]
+    return fact_price_daily
+
+
 def main():
     dim_stock = build_dim_stock()
 
@@ -111,6 +200,16 @@ def main():
 
     dim_stock.to_csv(DIM_STOCK_CSV, index=False)
     log.info(f"Đã ghi {DIM_STOCK_CSV}: {len(dim_stock)} dòng")
+
+    fact_price_daily = build_fact_price_daily(dim_stock["symbol"].tolist())
+
+    if len(fact_price_daily) == 0:
+        raise RuntimeError(
+            "build_fact_price_daily() trả về 0 dòng — dừng lại, không ghi CSV rỗng."
+        )
+
+    fact_price_daily.to_csv(FACT_PRICE_CSV, index=False)
+    log.info(f"Đã ghi {FACT_PRICE_CSV}: {len(fact_price_daily)} dòng")
 
 
 if __name__ == "__main__":
