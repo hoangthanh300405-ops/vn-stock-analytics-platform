@@ -131,8 +131,14 @@ def build_dim_stock() -> pd.DataFrame:
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=15))
 def _fetch_ohlcv_one_symbol(symbol: str, start: str, end: str) -> pd.DataFrame:
-    """Lấy giá OHLCV cho ĐÚNG 1 mã. Retry 3 lần vì API hay timeout/lỗi mạng tạm thời."""
-    df = Quote(symbol=symbol, source="VCI").history(start=start, end=end, interval="1D")
+    """Lấy giá OHLCV cho ĐÚNG 1 mã. Retry 3 lần vì API hay timeout/lỗi mạng tạm thời.
+
+    LƯU Ý: Quote ở đây là vnstock.explorer.vci.quote.Quote — bản đã gắn sẵn
+    nguồn VCI, __init__ KHÔNG nhận tham số source (khác với class Quote hợp
+    nhất ở top-level `from vnstock import Quote`). Truyền source="VCI" vào
+    đây sẽ bị TypeError ngay lập tức — đã xác nhận bằng inspect.signature().
+    """
+    df = Quote(symbol=symbol, show_log=False).history(start=start, end=end, interval="1D")
     return df
 
 
