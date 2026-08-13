@@ -49,9 +49,10 @@ log = logging.getLogger(__name__)
 
 COMPANY_PROFILE_CSV = "company_profile.csv"
 
-# Giống THROTTLE_SECONDS trong extract_vnstock.py — nghỉ giữa mỗi lần gọi để
-# tránh bị VCI chặn IP/rate-limit khi lặp qua ~1700 mã.
-THROTTLE_SECONDS = 0.3
+# Giới hạn API guest của VCI: 20 request/phút -> tối thiểu 3s/lần để không bị
+# chặn (đã gặp "Rate Limit Exceeded" thực tế với 0.3s cũ, xem lịch sử debug).
+# Đặt dư ra 3.5s cho an toàn.
+THROTTLE_SECONDS = 3.5
 
 # Ngưỡng lỗi tối đa cho phép trước khi coi là API lỗi diện rộng — giống
 # MAX_FAILED_SYMBOLS_RATIO trong extract_vnstock.py.
@@ -70,9 +71,10 @@ def _fetch_all_symbols() -> list[str]:
     return symbols
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=15))
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=5, max=30))
 def _fetch_overview_one_symbol(symbol: str) -> pd.DataFrame:
-    """Lấy company overview cho ĐÚNG 1 mã. Retry vì API hay timeout/lỗi mạng tạm thời."""
+    """Lấy company overview cho ĐÚNG 1 mã. Retry vì API hay timeout/lỗi mạng tạm thời,
+    hoặc bị rate-limit (20 request/phút với tài khoản Guest) -> wait tối thiểu 5s."""
     return Company(symbol=symbol, show_log=False).overview()
 
 
