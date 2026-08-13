@@ -2,7 +2,7 @@ version: 2
 
 sources:
   - name: vnstock_raw
-    database: vnstock_db
+    database: vnstock
     schema: raw
     description: Dữ liệu thô do load_to_motherduck.py nạp vào, chưa qua transform
     tables:
