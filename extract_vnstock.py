@@ -1,177 +1,98 @@
 """
-extract_vnstock.py
-----------------------
-Giai đoạn 1 (Extract) trong pipeline: gọi API vnstock, ghi ra các file CSV
-trung gian mà build_duckdb_file.py (giai đoạn 2 - Load) sẽ đọc vào.
+extract_company_profile.py
+----------------------------
+File RIÊNG, KHÔNG chạy chung với extract_vnstock.py (dim_stock + giá) — vì
+company_profile ít đổi, chỉ cần full refresh HÀNG TUẦN, không phải mỗi ngày
+(xem comment "chạy hàng tuần" trong build_duckdb_file.py::load_company_profile()
+và pages/2_Chi_tiet_ma.py). Chạy file này trong 1 workflow/step riêng, lịch
+thưa hơn daily_etl.yml (VD 1 lần/tuần) để không tốn thời gian + tránh gọi API
+quá nhiều lần không cần thiết.
 
-File này có 2 phần:
-  1. dim_stock.csv       - danh mục mã (symbol, organ_name, exchange, industry)
-  2. fact_price_daily.csv - giá OHLCV theo mã-ngày, chạy sau khi có dim_stock
-                            (cần danh sách mã từ bước 1 để lặp qua từng mã)
+Nguồn dữ liệu: vnstock v4.0.5, class Company của nguồn VCI. Đối chiếu trực
+tiếp với source code vnstock/explorer/vci/company.py (KHÔNG đoán tên cột từ
+tài liệu cũ):
 
-company_profile.csv (thông tin công ty, chạy hàng tuần) CHƯA có trong file
-này — build_duckdb_file.py đã tự bỏ qua nếu thiếu file này (xem
-load_company_profile()), nên không chặn pipeline hàng ngày.
+  - Company(symbol=<mã>, show_log=False).overview()
+      -> 1 dòng / 1 mã. KHÔNG nhận tham số source (giống Quote, Listing —
+         class này đã gắn sẵn nguồn VCI, xem inspect.signature(Company.__init__)
+         đã kiểm tra: (self, symbol, random_agent, to_df, show_log) — không
+         có source, truyền vào sẽ TypeError y hệt lỗi Quote gặp phải trước đó).
+      -> Cột trả về do chính overview() tự đổi tên 1 phần (camelCase ->
+         snake_case + vài rename cố định: ticker->symbol, profile->
+         company_profile, vi_organ_name->organ_name...), NHƯNG các cột còn
+         lại (founded_date, listing_date, charter_capital,
+         number_of_employees, business_model...) phụ thuộc JSON THẬT trả về
+         từ API, KHÔNG thể xác nhận 100% mà không gọi API thật.
 
-Nguồn dữ liệu: vnstock v4.0.5, nguồn VCI. Đối chiếu trực tiếp với source code
-vnstock/explorer/vci/listing.py và vnstock/explorer/vci/quote.py để đảm bảo
-đúng tên hàm/tên cột thật (KHÔNG dùng tên cột đoán từ tài liệu cũ):
-
-  - Listing().symbols_by_exchange()
-      -> 1 dòng / 1 mã, cột: symbol, exchange, type, organ_name, organ_short_name
-
-  - Listing().symbols_by_industries()
-      -> DẠNG DÀI: 1 mã có thể có tới 4 dòng (icb_level 1..4, từ ngành lớn
-         (VD "Tài chính") tới ngành nhỏ (VD "Ngân hàng thương mại")).
-      -> Ta chọn icb_level=2 làm "industry" hiển thị trên dashboard.
-         Đổi ICB_LEVEL_FOR_INDUSTRY bên dưới nếu muốn cấp khác.
-
-  - Quote(symbol=<mã>, source="VCI").history(start=..., end=..., interval="1D")
-      -> 1 dòng / 1 ngày giao dịch của ĐÚNG 1 mã, cột: time, open, high, low,
-         close, volume (KHÔNG có sẵn cột symbol -> phải tự thêm vào).
-      -> Gọi lặp qua TỪNG mã (API không có endpoint lấy nhiều mã 1 lần), nên
-         cần throttle (nghỉ giữa các lần gọi) để tránh bị chặn IP/rate-limit.
+⚠️ QUAN TRỌNG — làm việc này SAU KHI chạy file này lần đầu:
+   Mở company_profile.csv vừa tạo ra, đối chiếu danh sách cột thật với các
+   cột mà dbt_vnstock/models/staging/vnstock/stg_vnstock__company_profile.sql
+   đang SELECT (business_model, founded_date, listing_date, charter_capital,
+   number_of_employees). Nếu tên cột thật khác đi, sửa lại đúng theo CSV thật
+   trong file .sql đó — comment sẵn có trong file .sql cũng đã cảnh báo y hệt
+   điều này ("cần đối chiếu lại với dữ liệu thật sau khi chạy
+   extract_company_profile.py lần đầu").
 
 Yêu cầu: pip install vnstock==4.0.5 pandas tenacity (đã pin trong requirements.txt)
 """
 
 import logging
 import time
-from datetime import date, timedelta
 
 import pandas as pd
 from tenacity import retry, stop_after_attempt, wait_exponential
+from vnstock.explorer.vci.company import Company
 from vnstock.explorer.vci.listing import Listing
-from vnstock.explorer.vci.quote import Quote
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-DIM_STOCK_CSV = "dim_stock.csv"
-FACT_PRICE_CSV = "fact_price_daily.csv"
+COMPANY_PROFILE_CSV = "company_profile.csv"
 
-# Cấp ICB dùng làm cột "industry" — xem giải thích ở docstring phía trên.
-ICB_LEVEL_FOR_INDUSTRY = 2
+# Giới hạn API guest của VCI: 20 request/phút -> tối thiểu 3s/lần để không bị
+# chặn (đã gặp "Rate Limit Exceeded" thực tế với 0.3s cũ, xem lịch sử debug).
+# Đặt dư ra 3.5s cho an toàn.
+THROTTLE_SECONDS = 3.5
 
-# Số ngày lấy lùi về trước mỗi lần chạy. Đặt dư ra (không chỉ lấy 1 ngày hôm
-# qua) để tự vá những ngày bị miss do lần chạy trước lỗi/API tạm thời không
-# có dữ liệu — trùng lặp với dữ liệu cũ sẽ được dbt dedup ở bước staging
-# (ROW_NUMBER theo symbol+trade_date, xem stg_vnstock__fact_price_daily.sql).
-LOOKBACK_DAYS = 10
-
-# Nghỉ giữa mỗi lần gọi API cho 1 mã, để không bị VCI chặn vì gọi quá dồn dập.
-# Với ~1700 mã: 1700 * 0.3s ≈ 8.5 phút, cộng thời gian mạng thực tế mỗi call
-# -> nằm trong ngân sách 20-30 phút đã tính trong daily_etl.yml.
-THROTTLE_SECONDS = 0.3
-
-# Số mã lỗi tối đa được phép bỏ qua trước khi coi là API đang có sự cố diện
-# rộng và dừng hẳn (tránh ghi ra 1 file gần như rỗng mà không ai biết).
+# Ngưỡng lỗi tối đa cho phép trước khi coi là API lỗi diện rộng — giống
+# MAX_FAILED_SYMBOLS_RATIO trong extract_vnstock.py.
 MAX_FAILED_SYMBOLS_RATIO = 0.2
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=20))
-def _fetch_symbols_by_exchange() -> pd.DataFrame:
-    """Lấy danh sách mã + sàn + tên công ty. Retry vì API vnstock/VCI đôi khi timeout."""
-    log.info("Đang gọi Listing().symbols_by_exchange()...")
+def _fetch_all_symbols() -> list[str]:
+    """Lấy danh sách mã cổ phiếu thường (loại chứng quyền/trái phiếu/ETF)."""
+    log.info("Đang lấy danh sách mã từ Listing().symbols_by_exchange()...")
     df = Listing().symbols_by_exchange(lang="vi")
-    log.info(f"symbols_by_exchange trả về {len(df)} dòng")
-    return df
+    if "type" in df.columns:
+        df = df[df["type"] == "STOCK"]
+    symbols = df["symbol"].tolist()
+    log.info(f"Có {len(symbols)} mã cần lấy company profile")
+    return symbols
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=20))
-def _fetch_symbols_by_industries() -> pd.DataFrame:
-    """Lấy phân ngành ICB theo mã (dạng dài, nhiều icb_level/mã)."""
-    log.info("Đang gọi Listing().symbols_by_industries()...")
-    df = Listing().symbols_by_industries(lang="vi")
-    log.info(f"symbols_by_industries trả về {len(df)} dòng (dạng dài, nhiều level/mã)")
-    return df
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=5, max=30))
+def _fetch_overview_one_symbol(symbol: str) -> pd.DataFrame:
+    """Lấy company overview cho ĐÚNG 1 mã. Retry vì API hay timeout/lỗi mạng tạm thời,
+    hoặc bị rate-limit (20 request/phút với tài khoản Guest) -> wait tối thiểu 5s."""
+    return Company(symbol=symbol, show_log=False).overview()
 
 
-def build_dim_stock() -> pd.DataFrame:
-    """
-    Gộp symbols_by_exchange() + symbols_by_industries() thành 1 bảng
-    dim_stock: 1 dòng / 1 mã, cột symbol, organ_name, exchange, industry.
-    """
-    exchange_df = _fetch_symbols_by_exchange()
-
-    # Chỉ giữ cổ phiếu thường (loại bỏ chứng quyền/trái phiếu/ETF nếu type
-    # có các giá trị khác "STOCK") — theo đúng cách all_symbols() của chính
-    # vnstock lọc, xem listing.py.
-    if "type" in exchange_df.columns:
-        before = len(exchange_df)
-        exchange_df = exchange_df[exchange_df["type"] == "STOCK"].reset_index(drop=True)
-        log.info(f"Lọc type == 'STOCK': {before} -> {len(exchange_df)} dòng")
-
-    exchange_df = exchange_df[["symbol", "exchange", "organ_name"]]
-
-    industries_df = _fetch_symbols_by_industries()
-
-    # symbols_by_industries() trả dạng dài -> lọc đúng 1 level, mỗi mã còn 1 dòng.
-    # Một số mã có thể thiếu level 2 (dữ liệu ICB không đầy đủ) -> các mã đó sẽ
-    # có industry = NULL sau khi left join, dbt staging đã NULLIF/TRIM sẵn.
-    industry_at_level = (
-        industries_df[industries_df["icb_level"] == ICB_LEVEL_FOR_INDUSTRY][
-            ["symbol", "icb_name"]
-        ]
-        .drop_duplicates(subset=["symbol"])
-        .rename(columns={"icb_name": "industry"})
-    )
-    missing = set(exchange_df["symbol"]) - set(industry_at_level["symbol"])
-    if missing:
-        log.warning(
-            f"{len(missing)} mã không có industry ở icb_level={ICB_LEVEL_FOR_INDUSTRY} "
-            "(sẽ để trống, không chặn pipeline)"
-        )
-
-    dim_stock = exchange_df.merge(industry_at_level, on="symbol", how="left")
-    dim_stock = dim_stock[["symbol", "organ_name", "exchange", "industry"]]
-
-    return dim_stock
-
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=15))
-def _fetch_ohlcv_one_symbol(symbol: str, start: str, end: str) -> pd.DataFrame:
-    """Lấy giá OHLCV cho ĐÚNG 1 mã. Retry 3 lần vì API hay timeout/lỗi mạng tạm thời.
-
-    LƯU Ý: Quote ở đây là vnstock.explorer.vci.quote.Quote — bản đã gắn sẵn
-    nguồn VCI, __init__ KHÔNG nhận tham số source (khác với class Quote hợp
-    nhất ở top-level `from vnstock import Quote`). Truyền source="VCI" vào
-    đây sẽ bị TypeError ngay lập tức — đã xác nhận bằng inspect.signature().
-    """
-    df = Quote(symbol=symbol, show_log=False).history(start=start, end=end, interval="1D")
-    return df
-
-
-def build_fact_price_daily(symbols: list[str]) -> pd.DataFrame:
-    """
-    Lặp qua từng mã trong `symbols`, gọi Quote.history(), gộp lại thành 1 bảng
-    fact_price_daily: cột symbol, time, open, high, low, close, volume.
-    """
-    end_date = date.today()
-    start_date = end_date - timedelta(days=LOOKBACK_DAYS)
-    start_str = start_date.isoformat()
-    end_str = end_date.isoformat()
-
-    log.info(
-        f"Lấy giá OHLCV cho {len(symbols)} mã, khoảng {start_str} -> {end_str} "
-        f"(lookback {LOOKBACK_DAYS} ngày)..."
-    )
-
+def build_company_profile(symbols: list[str]) -> pd.DataFrame:
+    """Lặp qua từng mã, gọi Company.overview(), gộp lại thành 1 bảng."""
     all_frames = []
     failed_symbols = []
 
     for i, symbol in enumerate(symbols, start=1):
         try:
-            df = _fetch_ohlcv_one_symbol(symbol, start_str, end_str)
+            df = _fetch_overview_one_symbol(symbol)
             if df is not None and len(df) > 0:
-                df = df.copy()
-                df["symbol"] = symbol
                 all_frames.append(df)
         except Exception as e:
-            # Không để 1 mã lỗi (VD mã đã huỷ niêm yết, mã mới chưa có giá)
-            # làm chết cả job — log lại và đi tiếp, tổng hợp cảnh báo ở cuối.
+            # 1 mã lỗi (VD mã mới niêm yết chưa có đủ hồ sơ công ty) không
+            # được làm chết cả batch — log lại, đi tiếp, tổng hợp ở cuối.
             failed_symbols.append(symbol)
-            log.warning(f"[{i}/{len(symbols)}] Lỗi khi lấy giá {symbol}: {e}")
+            log.warning(f"[{i}/{len(symbols)}] Lỗi khi lấy company profile {symbol}: {e}")
 
         if i % 100 == 0:
             log.info(f"Tiến độ: {i}/{len(symbols)} mã đã xử lý...")
@@ -181,41 +102,47 @@ def build_fact_price_daily(symbols: list[str]) -> pd.DataFrame:
     fail_ratio = len(failed_symbols) / len(symbols) if symbols else 0
     if fail_ratio > MAX_FAILED_SYMBOLS_RATIO:
         raise RuntimeError(
-            f"{len(failed_symbols)}/{len(symbols)} mã ({fail_ratio:.0%}) lấy giá thất bại "
-            f"— vượt ngưỡng {MAX_FAILED_SYMBOLS_RATIO:.0%}, nghi ngờ API đang lỗi diện rộng. "
-            "Dừng lại, không ghi file dữ liệu thiếu sót."
+            f"{len(failed_symbols)}/{len(symbols)} mã ({fail_ratio:.0%}) lấy company profile "
+            f"thất bại — vượt ngưỡng {MAX_FAILED_SYMBOLS_RATIO:.0%}, nghi ngờ API đang lỗi diện "
+            "rộng. Dừng lại, không ghi file dữ liệu thiếu sót."
         )
     if failed_symbols:
-        log.warning(f"Có {len(failed_symbols)} mã lấy giá thất bại (đã bỏ qua): {failed_symbols}")
+        log.warning(
+            f"Có {len(failed_symbols)} mã lấy company profile thất bại (đã bỏ qua): "
+            f"{failed_symbols}"
+        )
 
     if not all_frames:
-        return pd.DataFrame(columns=["symbol", "time", "open", "high", "low", "close", "volume"])
+        return pd.DataFrame()
 
-    fact_price_daily = pd.concat(all_frames, ignore_index=True)
-    fact_price_daily = fact_price_daily[["symbol", "time", "open", "high", "low", "close", "volume"]]
-    return fact_price_daily
+    # union_by_name=True ở phía đọc CSV (build_duckdb_file.py) đã xử lý việc
+    # các dòng có thể thiếu/thừa cột khác nhau -> ở đây chỉ cần concat thẳng,
+    # không ép cứng danh sách cột (KHÔNG đoán tên cột, xem cảnh báo ở docstring).
+    company_profile = pd.concat(all_frames, ignore_index=True)
+    return company_profile
 
 
 def main():
-    dim_stock = build_dim_stock()
+    symbols = _fetch_all_symbols()
 
-    if len(dim_stock) == 0:
-        # Không ghi file rỗng — build_duckdb_file.py đã có sẵn guard chặn CSV
-        # rỗng ghi đè dữ liệu tốt, nhưng chặn sớm ở đây rõ ràng hơn.
-        raise RuntimeError("build_dim_stock() trả về 0 dòng — dừng lại, không ghi CSV rỗng.")
+    if not symbols:
+        raise RuntimeError("Không lấy được danh sách mã — dừng lại, không ghi CSV rỗng.")
 
-    dim_stock.to_csv(DIM_STOCK_CSV, index=False)
-    log.info(f"Đã ghi {DIM_STOCK_CSV}: {len(dim_stock)} dòng")
+    company_profile = build_company_profile(symbols)
 
-    fact_price_daily = build_fact_price_daily(dim_stock["symbol"].tolist())
-
-    if len(fact_price_daily) == 0:
+    if len(company_profile) == 0:
         raise RuntimeError(
-            "build_fact_price_daily() trả về 0 dòng — dừng lại, không ghi CSV rỗng."
+            "build_company_profile() trả về 0 dòng — dừng lại, không ghi CSV rỗng "
+            "(build_duckdb_file.py sẽ bỏ qua nếu không thấy file này, nên KHÔNG ghi "
+            "file rỗng đè lên dữ liệu tốt của tuần trước nếu có)."
         )
 
-    fact_price_daily.to_csv(FACT_PRICE_CSV, index=False)
-    log.info(f"Đã ghi {FACT_PRICE_CSV}: {len(fact_price_daily)} dòng")
+    company_profile.to_csv(COMPANY_PROFILE_CSV, index=False)
+    log.info(f"Đã ghi {COMPANY_PROFILE_CSV}: {len(company_profile)} dòng")
+    log.info(
+        f"Các cột thật sự có trong CSV: {list(company_profile.columns)} "
+        "— đối chiếu với stg_vnstock__company_profile.sql, xem cảnh báo ở đầu file này."
+    )
 
 
 if __name__ == "__main__":
