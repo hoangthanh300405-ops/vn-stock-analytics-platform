@@ -56,7 +56,7 @@ def get_connection() -> duckdb.DuckDBPyConnection:
 def bootstrap_schema(con: duckdb.DuckDBPyConnection):
     """Tạo schema/bảng cần thiết nếu chưa có - idempotent.
 
-    Fix 2026-08-14: raw.company_profile giờ được tạo (rỗng, nếu chưa có)
+    Fix 2026-08-14 (1): raw.company_profile giờ được tạo (rỗng, nếu chưa có)
     NGAY TỪ ĐÂY, không đợi tới lúc load_company_profile() thấy CSV nữa.
     Lý do: dim_stock.sql (chạy trong CẢ job daily) join qua
     stg_vnstock__company_profile.sql, model này SELECT thẳng từ source
@@ -66,16 +66,22 @@ def bootstrap_schema(con: duckdb.DuckDBPyConnection):
     exist" ngay ở model này, dù bản thân job daily không hề cần tới company
     profile. Bảng rỗng này sẽ bị CREATE OR REPLACE ghi đè bằng dữ liệu thật
     ngay khi weekly_company_profile.yml chạy lần đầu (xem load_company_profile()).
+
+    Fix 2026-08-14 (2): tên cột của bảng rỗng này ĐÃ ĐƯỢC SỬA cho khớp với
+    danh sách cột THẬT lấy được từ lần chạy weekly đầu tiên (xem giải thích
+    đầy đủ ở đầu file stg_vnstock__company_profile.sql) — company_profile,
+    market_cap, foreigner_percentage — KHÔNG còn business_model/
+    founded_date/charter_capital/number_of_employees như giả định ban đầu,
+    vì các cột đó không tồn tại trong dữ liệu thật.
     """
     con.execute("CREATE SCHEMA IF NOT EXISTS raw")
     con.execute("""
         CREATE TABLE IF NOT EXISTS raw.company_profile (
             symbol VARCHAR,
-            business_model VARCHAR,
-            founded_date VARCHAR,
+            company_profile VARCHAR,
             listing_date VARCHAR,
-            charter_capital VARCHAR,
-            number_of_employees VARCHAR
+            market_cap VARCHAR,
+            foreigner_percentage VARCHAR
         )
     """)
 
