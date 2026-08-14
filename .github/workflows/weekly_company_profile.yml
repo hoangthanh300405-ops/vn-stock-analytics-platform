@@ -1,0 +1,103 @@
+name: Weekly Company Profile ETL
+
+# Fix 2026-08-14: "Extract company profile" từng bị gộp nhầm vào chung job
+# với daily_etl.yml -> luôn bị GitHub Actions cancel vì riêng bước đó cần
+# TỐI THIỂU ~102 phút (1749 mã x throttle 3.5s) trong khi job daily chỉ còn
+# lại vài chục phút sau "Extract từ vnstock". Tách hẳn ra workflow này, đúng
+# như thiết kế ban đầu ghi trong docstring của extract_company_profile.py.
+
+on:
+  schedule:
+    # 20:00 giờ Việt Nam (UTC+7) = 13:00 UTC, tối Chủ nhật hàng tuần — ngoài
+    # giờ chạy của daily_etl.yml (08:45 UTC các ngày trong tuần) để 2 job
+    # không bao giờ overlap thời gian, giảm khả năng phải chờ concurrency lock.
+    - cron: "0 13 * * 0"
+  workflow_dispatch: {}  # cho phép trigger thủ công để test
+
+# Dùng CHUNG concurrency group với daily_etl.yml vì cả 2 đều đọc/ghi cùng 1
+# file vnstock.duckdb qua GitHub Release — chạy đè lên nhau cùng lúc sẽ làm
+# hỏng file (xem comment gốc trong daily_etl.yml).
+concurrency:
+  group: vnstock-data-release
+  cancel-in-progress: false
+
+jobs:
+  etl:
+    runs-on: ubuntu-latest
+    # Rộng rãi hơn hẳn daily_etl.yml: riêng throttle 3.5s x ~1749 mã đã cần
+    # ~102 phút TỐI THIỂU dù API không lỗi request nào, cộng thời gian gọi
+    # API thực tế + dbt run/test + để dư biên an toàn cho retry/circuit
+    # breaker trong extract_company_profile.py (MAX_RUNTIME_SECONDS = 150
+    # phút cho riêng bước lấy dữ liệu).
+    timeout-minutes: 180
+
+    env:
+      DUCKDB_FILE_PATH: ${{ github.workspace }}/vnstock.duckdb
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt dbt-duckdb
+
+      - name: Đảm bảo GitHub Release "latest-data" tồn tại
+        run: |
+          gh release view latest-data || gh release create latest-data \
+            --title "Latest vnstock data" \
+            --notes "File .duckdb tự động cập nhật bởi daily_etl.yml + weekly_company_profile.yml — đừng sửa tay."
+
+      - name: Tải file .duckdb của lần chạy trước (nếu có)
+        run: |
+          gh release download latest-data --pattern "vnstock.duckdb" \
+            --dir "${{ github.workspace }}" --clobber \
+            || echo "Chưa có file trước đó, workflow daily_etl.yml cần chạy ít nhất 1 lần trước khi weekly chạy lần đầu."
+
+      - name: Extract company profile
+        run: python extract_company_profile.py
+
+      - name: Load company profile vào file DuckDB
+        # build_duckdb_file.py giờ tự bỏ qua dim_stock.csv/fact_price_daily.csv
+        # nếu không tồn tại (xem fix trong file đó) -> chạy an toàn ở đây dù
+        # workflow này không có 2 file CSV đó.
+        run: python build_duckdb_file.py
+
+      - name: Cấu hình dbt profile
+        run: |
+          mkdir -p ~/.dbt
+          cp dbt_vnstock/profiles.yml ~/.dbt/profiles.yml
+
+      - name: dbt seed (nạp bảng ngày nghỉ lễ VN)
+        working-directory: dbt_vnstock
+        run: dbt seed
+
+      - name: dbt run (chỉ rebuild dim_stock + dim_sector, phần phụ thuộc company_profile)
+        working-directory: dbt_vnstock
+        run: dbt run --select dim_stock dim_sector
+
+      - name: dbt test
+        working-directory: dbt_vnstock
+        run: dbt test --select dim_stock dim_sector
+
+      - name: Upload file .duckdb mới lên GitHub Release
+        if: success()
+        run: gh release upload latest-data "${{ github.workspace }}/vnstock.duckdb" --clobber
+
+      - name: Upload CSV làm artifact (debug khi cần)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: company-profile-${{ github.run_number }}
+          path: company_profile.csv
+          retention-days: 7
+
+      - name: Thông báo khi job fail
+        if: failure()
+        run: echo "::error::Weekly company profile ETL thất bại ở run #${{ github.run_number }} - kiểm tra log ở bước Extract/Load phía trên"
