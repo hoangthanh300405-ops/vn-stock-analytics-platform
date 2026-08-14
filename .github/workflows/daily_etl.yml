@@ -86,7 +86,7 @@ jobs:
             dim_stock.csv
             fact_price_daily.csv
           retention-days: 7
-
+  
       - name: Thông báo khi job fail
         if: failure()
         run: echo "::error::ETL job thất bại ở run #${{ github.run_number }} - kiểm tra log ở bước Extract/Load phía trên"
