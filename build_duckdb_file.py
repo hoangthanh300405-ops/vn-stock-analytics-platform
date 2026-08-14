@@ -54,8 +54,30 @@ def get_connection() -> duckdb.DuckDBPyConnection:
 
 
 def bootstrap_schema(con: duckdb.DuckDBPyConnection):
-    """Tạo schema nếu chưa có (database đã tạo/USE trong get_connection) - idempotent"""
+    """Tạo schema/bảng cần thiết nếu chưa có - idempotent.
+
+    Fix 2026-08-14: raw.company_profile giờ được tạo (rỗng, nếu chưa có)
+    NGAY TỪ ĐÂY, không đợi tới lúc load_company_profile() thấy CSV nữa.
+    Lý do: dim_stock.sql (chạy trong CẢ job daily) join qua
+    stg_vnstock__company_profile.sql, model này SELECT thẳng từ source
+    raw.company_profile — nếu bảng chưa từng tồn tại (VD lần chạy daily đầu
+    tiên sau khi tách weekly_company_profile.yml ra riêng, và weekly chưa
+    kịp chạy lần nào), dbt run sẽ lỗi "Catalog Error: Table ... does not
+    exist" ngay ở model này, dù bản thân job daily không hề cần tới company
+    profile. Bảng rỗng này sẽ bị CREATE OR REPLACE ghi đè bằng dữ liệu thật
+    ngay khi weekly_company_profile.yml chạy lần đầu (xem load_company_profile()).
+    """
     con.execute("CREATE SCHEMA IF NOT EXISTS raw")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS raw.company_profile (
+            symbol VARCHAR,
+            business_model VARCHAR,
+            founded_date VARCHAR,
+            listing_date VARCHAR,
+            charter_capital VARCHAR,
+            number_of_employees VARCHAR
+        )
+    """)
 
 
 def load_dim_stock(con: duckdb.DuckDBPyConnection):
