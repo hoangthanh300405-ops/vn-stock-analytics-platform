@@ -7,6 +7,14 @@ company_profile ít đổi, chỉ cần full refresh HÀNG TUẦN, không phải
 và pages/2_Chi_tiet_ma.py). File này được chạy bởi workflow RIÊNG
 weekly_company_profile.yml (lịch thưa hơn daily_etl.yml, VD 1 lần/tuần).
 
+⚠️ SỰ CỐ 2026-08-14 (2) — "Rate Limit Exceeded, Process terminated" từ
+   vnstock: gói Community giới hạn cứng 60 request/phút, vượt ngưỡng là
+   THOÁT LUÔN CẢ TIẾN TRÌNH (nghi SystemExit, không bị `except Exception`
+   bắt được). File này vốn đã throttle 3.5s/mã (~17/phút) nên khó chạm
+   ngưỡng hơn extract_vnstock.py, nhưng vẫn thêm RateLimiter + bắt
+   BaseException để phòng thủ kép (retry dồn dập có thể đẩy tốc độ request
+   thực tế cao hơn throttle danh nghĩa).
+
 ⚠️ SỰ CỐ 2026-08-14 — "Extract company profile" từng bị gộp nhầm vào chung
    job với daily_etl.yml (chạy nối tiếp sau "Extract từ vnstock" trong CÙNG
    1 job có timeout-minutes: 60) -> LUÔN LUÔN bị cancel, không liên quan gì
@@ -45,6 +53,7 @@ tài liệu cũ):
 Yêu cầu: pip install vnstock==4.0.5 pandas tenacity (đã pin trong requirements.txt)
 """
 
+import collections
 import concurrent.futures
 import logging
 import time
@@ -60,14 +69,12 @@ log = logging.getLogger(__name__)
 
 COMPANY_PROFILE_CSV = "company_profile.csv"
 
-# Giới hạn API guest của VCI: 20 request/phút -> tối thiểu 3s/lần để không bị
-# chặn (đã gặp "Rate Limit Exceeded" thực tế với 0.3s cũ, xem lịch sử debug).
-# Đặt dư ra 3.5s cho an toàn.
-# LƯU Ý: với ~1749 mã, riêng throttle này đã cần TỐI THIỂU ~102 phút, đây là
-# lý do chính khiến file này BẮT BUỘC phải chạy trong workflow riêng có
-# timeout-minutes rộng rãi (xem weekly_company_profile.yml), không thể nhét
-# chung vào job daily_etl.yml.
-THROTTLE_SECONDS = 3.5
+# Việc throttle giờ do RateLimiter (bên dưới) đảm nhiệm, tính theo request
+# thật thay vì sleep cố định theo số mã — xem class RateLimiter. Với giới
+# hạn 45 request/phút (biên an toàn dưới 60), ~1749 mã cần TỐI THIỂU ~39
+# phút chỉ riêng phần pacing — đây vẫn là lý do chính khiến file này BẮT
+# BUỘC phải chạy trong workflow riêng có timeout-minutes rộng rãi (xem
+# weekly_company_profile.yml), không thể nhét chung vào job daily_etl.yml.
 
 # Ngưỡng lỗi tối đa cho phép trước khi coi là API lỗi diện rộng — giống
 # MAX_FAILED_SYMBOLS_RATIO trong extract_vnstock.py.
@@ -88,9 +95,43 @@ CIRCUIT_BREAKER_CONSECUTIVE_FAILURES = 25
 MAX_RUNTIME_SECONDS = 150 * 60
 
 
+class RateLimiter:
+    """Xem giải thích chi tiết ở extract_vnstock.py::RateLimiter — sliding
+    window tính CHUNG cho mọi lần gọi API thật, kể cả các lần retry."""
+
+    def __init__(self, max_calls: int, period_seconds: float):
+        self.max_calls = max_calls
+        self.period_seconds = period_seconds
+        self._call_times: collections.deque = collections.deque()
+
+    def wait(self):
+        now = time.monotonic()
+        while self._call_times and now - self._call_times[0] > self.period_seconds:
+            self._call_times.popleft()
+        if len(self._call_times) >= self.max_calls:
+            sleep_for = self.period_seconds - (now - self._call_times[0]) + 0.05
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            now = time.monotonic()
+            while self._call_times and now - self._call_times[0] > self.period_seconds:
+                self._call_times.popleft()
+        self._call_times.append(time.monotonic())
+
+
+# Giới hạn thật của vnstock (Community) là 60 request/phút — đặt 45 làm biên
+# an toàn, giống extract_vnstock.py.
+rate_limiter = RateLimiter(max_calls=45, period_seconds=60)
+
+
+def _is_vnstock_hard_rate_limit(exc: BaseException) -> bool:
+    msg = str(exc)
+    return "Rate Limit" in msg or "rate limit" in msg.lower()
+
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=20))
 def _fetch_all_symbols() -> list[str]:
     """Lấy danh sách mã cổ phiếu thường (loại chứng quyền/trái phiếu/ETF)."""
+    rate_limiter.wait()
     log.info("Đang lấy danh sách mã từ Listing().symbols_by_exchange()...")
     df = Listing().symbols_by_exchange(lang="vi")
     if "type" in df.columns:
@@ -130,6 +171,7 @@ def _call_with_hard_timeout(fn, timeout_seconds: float):
 def _fetch_overview_one_symbol(symbol: str) -> pd.DataFrame:
     """Lấy company overview cho ĐÚNG 1 mã. Retry 2 lần (giảm từ 3), mỗi lần bị
     chặn bởi HARD_CALL_TIMEOUT_SECONDS thay vì chờ timeout mặc định của thư viện."""
+    rate_limiter.wait()
     return _call_with_hard_timeout(
         lambda: Company(symbol=symbol, show_log=False).overview(),
         HARD_CALL_TIMEOUT_SECONDS,
@@ -166,11 +208,24 @@ def build_company_profile(symbols: list[str]) -> pd.DataFrame:
             if df is not None and len(df) > 0:
                 all_frames.append(df)
             consecutive_failures = 0
-        except Exception as e:
-            # 1 mã lỗi (VD mã mới niêm yết chưa có đủ hồ sơ công ty) không
-            # được làm chết cả batch — log lại, đi tiếp, tổng hợp ở cuối.
+        except KeyboardInterrupt:
+            raise
+        except BaseException as e:
+            # Bắt cả BaseException — xem giải thích ở extract_vnstock.py,
+            # cùng lỗi "Rate Limit Exceeded ... Process terminated" của
+            # vnstock. 1 mã lỗi không được làm chết cả batch.
             failed_symbols.append(symbol)
             consecutive_failures += 1
+            if _is_vnstock_hard_rate_limit(e):
+                log.error(
+                    f"[{i}/{len(symbols)}] Chạm giới hạn rate-limit CỨNG của vnstock "
+                    f"dù đã qua RateLimiter — dừng ngay lập tức: {e}"
+                )
+                stopped_early_reason = (
+                    f"Chạm rate-limit cứng của vnstock ở mã {i}/{len(symbols)} — dừng "
+                    "sớm, phần còn lại sẽ được vá ở lần chạy tuần sau."
+                )
+                break
             log.warning(f"[{i}/{len(symbols)}] Lỗi khi lấy company profile {symbol}: {e}")
 
             if consecutive_failures >= CIRCUIT_BREAKER_CONSECUTIVE_FAILURES:
@@ -184,8 +239,6 @@ def build_company_profile(symbols: list[str]) -> pd.DataFrame:
 
         if i % 100 == 0:
             log.info(f"Tiến độ: {i}/{len(symbols)} mã đã xử lý...")
-
-        time.sleep(THROTTLE_SECONDS)
 
     attempted = len(all_frames) + len(failed_symbols)
     fail_ratio = len(failed_symbols) / attempted if attempted else 1.0
