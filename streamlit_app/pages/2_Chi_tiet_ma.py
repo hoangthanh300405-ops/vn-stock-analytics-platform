@@ -1,6 +1,12 @@
 """
 pages/2_Chi_tiet_ma.py - Chọn 1 mã, xem biểu đồ giá/khối lượng theo thời gian
 + thông tin công ty phát hành (từ dim_stock đã join company_profile)
+
+Fix 2026-08-14: business_model/founded_date/charter_capital/number_of_employees
+KHÔNG tồn tại trong dữ liệu thật trả về từ Company.overview() (xem giải thích
+đầy đủ ở stg_vnstock__company_profile.sql) -> đổi sang các cột thật:
+business_description (mô tả doanh nghiệp dạng text), market_cap (vốn hoá thị
+trường, KHÔNG phải vốn điều lệ), foreigner_percentage (room ngoại hiện tại).
 """
 
 import streamlit as st
@@ -20,8 +26,8 @@ symbol = st.selectbox("Chọn mã", all_symbols)
 # ── Thông tin công ty phát hành ──────────────────────────────────────────
 info = run_query(
     """
-    SELECT company_name, exchange, sector_name, business_model,
-           founded_date, listing_date, charter_capital, number_of_employees
+    SELECT company_name, exchange, sector_name, business_description,
+           listing_date, market_cap, foreigner_percentage
     FROM dim_stock WHERE symbol = ?
     """,
     (symbol,),
@@ -33,13 +39,18 @@ if not info.empty:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Sàn", row["exchange"] or "—")
     c2.metric("Ngành", row["sector_name"] or "—")
-    c3.metric("Vốn điều lệ", f"{row['charter_capital']:,.0f}" if row["charter_capital"] else "—")
-    c4.metric("Số nhân viên", f"{row['number_of_employees']:,.0f}" if row["number_of_employees"] else "—")
-    if row["business_model"]:
-        with st.expander("Mô hình kinh doanh"):
-            st.write(row["business_model"])
+    c3.metric("Vốn hoá", f"{row['market_cap']:,.0f}" if row["market_cap"] else "—")
+    c4.metric(
+        "Room ngoại",
+        f"{row['foreigner_percentage']:.1%}" if row["foreigner_percentage"] is not None else "—",
+    )
+    if row["listing_date"]:
+        st.caption(f"Ngày niêm yết: {row['listing_date']}")
+    if row["business_description"]:
+        with st.expander("Giới thiệu công ty"):
+            st.write(row["business_description"])
 else:
-    st.info("Chưa có thông tin công ty cho mã này — có thể chưa chạy extract_company_profile.py")
+    st.info("Chưa có thông tin công ty cho mã này — có thể chưa chạy weekly_company_profile.yml")
 
 # ── Biểu đồ giá + khối lượng ──────────────────────────────────────────────
 date_range = st.slider("Số ngày gần nhất", min_value=30, max_value=365, value=90, step=30)
