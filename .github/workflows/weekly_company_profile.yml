@@ -61,6 +61,8 @@ jobs:
             || echo "Chưa có file trước đó, workflow daily_etl.yml cần chạy ít nhất 1 lần trước khi weekly chạy lần đầu."
 
       - name: Extract company profile
+        env:
+          VNSTOCK_API_KEY: ${{ secrets.VNSTOCK_API_KEY }}
         run: python extract_company_profile.py
 
       - name: Load company profile vào file DuckDB
