@@ -53,9 +53,6 @@ jobs:
           VNSTOCK_API_KEY: ${{ secrets.VNSTOCK_API_KEY }}
         run: python extract_vnstock.py
 
-      - name: Extract company profile
-        run: python extract_company_profile.py
-
       - name: Load vào file DuckDB
         run: python build_duckdb_file.py
 
