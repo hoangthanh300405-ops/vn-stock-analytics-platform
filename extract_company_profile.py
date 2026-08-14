@@ -4,9 +4,18 @@ extract_company_profile.py
 File RIÊNG, KHÔNG chạy chung với extract_vnstock.py (dim_stock + giá) — vì
 company_profile ít đổi, chỉ cần full refresh HÀNG TUẦN, không phải mỗi ngày
 (xem comment "chạy hàng tuần" trong build_duckdb_file.py::load_company_profile()
-và pages/2_Chi_tiet_ma.py). Chạy file này trong 1 workflow/step riêng, lịch
-thưa hơn daily_etl.yml (VD 1 lần/tuần) để không tốn thời gian + tránh gọi API
-quá nhiều lần không cần thiết.
+và pages/2_Chi_tiet_ma.py). File này được chạy bởi workflow RIÊNG
+weekly_company_profile.yml (lịch thưa hơn daily_etl.yml, VD 1 lần/tuần).
+
+⚠️ SỰ CỐ 2026-08-14 — "Extract company profile" từng bị gộp nhầm vào chung
+   job với daily_etl.yml (chạy nối tiếp sau "Extract từ vnstock" trong CÙNG
+   1 job có timeout-minutes: 60) -> LUÔN LUÔN bị cancel, không liên quan gì
+   tới việc API có lỗi hay không: với ~1749 mã x THROTTLE_SECONDS=3.5s, riêng
+   bước này cần tối thiểu ~102 PHÚT dù API chạy hoàn hảo không lỗi 1 request
+   nào, trong khi job daily chỉ còn lại vài chục phút sau khi "Extract từ
+   vnstock" đã chạy xong. Fix: tách hẳn ra workflow tuần riêng
+   (weekly_company_profile.yml) với timeout-minutes rộng rãi hơn nhiều,
+   đúng như thiết kế ban đầu của docstring này.
 
 Nguồn dữ liệu: vnstock v4.0.5, class Company của nguồn VCI. Đối chiếu trực
 tiếp với source code vnstock/explorer/vci/company.py (KHÔNG đoán tên cột từ
@@ -36,8 +45,10 @@ tài liệu cũ):
 Yêu cầu: pip install vnstock==4.0.5 pandas tenacity (đã pin trong requirements.txt)
 """
 
+import concurrent.futures
 import logging
 import time
+from datetime import date
 
 import pandas as pd
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -52,11 +63,29 @@ COMPANY_PROFILE_CSV = "company_profile.csv"
 # Giới hạn API guest của VCI: 20 request/phút -> tối thiểu 3s/lần để không bị
 # chặn (đã gặp "Rate Limit Exceeded" thực tế với 0.3s cũ, xem lịch sử debug).
 # Đặt dư ra 3.5s cho an toàn.
+# LƯU Ý: với ~1749 mã, riêng throttle này đã cần TỐI THIỂU ~102 phút, đây là
+# lý do chính khiến file này BẮT BUỘC phải chạy trong workflow riêng có
+# timeout-minutes rộng rãi (xem weekly_company_profile.yml), không thể nhét
+# chung vào job daily_etl.yml.
 THROTTLE_SECONDS = 3.5
 
 # Ngưỡng lỗi tối đa cho phép trước khi coi là API lỗi diện rộng — giống
 # MAX_FAILED_SYMBOLS_RATIO trong extract_vnstock.py.
 MAX_FAILED_SYMBOLS_RATIO = 0.2
+
+# ── Phòng thủ khi VCI lỗi diện rộng (giống extract_vnstock.py) ─────────────
+# Timeout tầng ứng dụng cho MỖI LẦN gọi Company.overview(), không phụ thuộc
+# timeout mặc định của thư viện HTTP bên trong vnstock.
+HARD_CALL_TIMEOUT_SECONDS = 15
+
+# Nếu có ngần này mã LIÊN TIẾP lỗi, coi như API đang sập diện rộng -> dừng
+# sớm, vẫn ghi phần đã lấy được thay vì cố chạy hết rồi bị cancel mất trắng.
+CIRCUIT_BREAKER_CONSECUTIVE_FAILURES = 25
+
+# Ngân sách thời gian tối đa cho bước lấy company profile. Đặt theo
+# timeout-minutes của weekly_company_profile.yml trừ hao cho các bước
+# Load/dbt run/dbt test/upload phía sau (xem workflow đó).
+MAX_RUNTIME_SECONDS = 150 * 60
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=20))
@@ -71,42 +100,116 @@ def _fetch_all_symbols() -> list[str]:
     return symbols
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=5, max=30))
+def _rotate_symbols(symbols: list[str]) -> list[str]:
+    """Xoay vòng thứ tự mã theo tuần (giống _rotate_symbols trong
+    extract_vnstock.py) — phòng khi vẫn phải dừng sớm vì circuit breaker/hết
+    ngân sách thời gian, nhóm mã bị bỏ sót sẽ không phải lúc nào cũng là cùng
+    1 nhóm cuối danh sách."""
+    if not symbols:
+        return symbols
+    offset = (date.today().toordinal() // 7) % len(symbols)
+    return symbols[offset:] + symbols[:offset]
+
+
+def _call_with_hard_timeout(fn, timeout_seconds: float):
+    """Xem giải thích chi tiết ở extract_vnstock.py::_call_with_hard_timeout —
+    ép timeout tầng ứng dụng, không phụ thuộc timeout mặc định của thư viện."""
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(fn)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except concurrent.futures.TimeoutError as e:
+        raise TimeoutError(
+            f"Vượt quá hard timeout {timeout_seconds}s (tầng ứng dụng)"
+        ) from e
+    finally:
+        executor.shutdown(wait=False)
+
+
+@retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=2, min=2, max=10))
 def _fetch_overview_one_symbol(symbol: str) -> pd.DataFrame:
-    """Lấy company overview cho ĐÚNG 1 mã. Retry vì API hay timeout/lỗi mạng tạm thời,
-    hoặc bị rate-limit (20 request/phút với tài khoản Guest) -> wait tối thiểu 5s."""
-    return Company(symbol=symbol, show_log=False).overview()
+    """Lấy company overview cho ĐÚNG 1 mã. Retry 2 lần (giảm từ 3), mỗi lần bị
+    chặn bởi HARD_CALL_TIMEOUT_SECONDS thay vì chờ timeout mặc định của thư viện."""
+    return _call_with_hard_timeout(
+        lambda: Company(symbol=symbol, show_log=False).overview(),
+        HARD_CALL_TIMEOUT_SECONDS,
+    )
 
 
 def build_company_profile(symbols: list[str]) -> pd.DataFrame:
-    """Lặp qua từng mã, gọi Company.overview(), gộp lại thành 1 bảng."""
+    """Lặp qua từng mã, gọi Company.overview(), gộp lại thành 1 bảng.
+
+    Có circuit breaker + ngân sách thời gian giống build_fact_price_daily()
+    trong extract_vnstock.py — nếu phải dừng sớm, vẫn ghi ra phần dữ liệu đã
+    lấy được thành công thay vì mất trắng."""
+    symbols = _rotate_symbols(symbols)
+
     all_frames = []
     failed_symbols = []
+    consecutive_failures = 0
+    stopped_early_reason = None
+    loop_start = time.monotonic()
 
     for i, symbol in enumerate(symbols, start=1):
+        elapsed = time.monotonic() - loop_start
+        if elapsed > MAX_RUNTIME_SECONDS:
+            stopped_early_reason = (
+                f"Đã chạy {elapsed:.0f}s, vượt ngân sách {MAX_RUNTIME_SECONDS}s "
+                f"-> dừng sớm ở mã {i}/{len(symbols)} để các bước sau (Load, dbt) "
+                "còn kịp chạy trong timeout-minutes của job."
+            )
+            log.warning(stopped_early_reason)
+            break
+
         try:
             df = _fetch_overview_one_symbol(symbol)
             if df is not None and len(df) > 0:
                 all_frames.append(df)
+            consecutive_failures = 0
         except Exception as e:
             # 1 mã lỗi (VD mã mới niêm yết chưa có đủ hồ sơ công ty) không
             # được làm chết cả batch — log lại, đi tiếp, tổng hợp ở cuối.
             failed_symbols.append(symbol)
+            consecutive_failures += 1
             log.warning(f"[{i}/{len(symbols)}] Lỗi khi lấy company profile {symbol}: {e}")
+
+            if consecutive_failures >= CIRCUIT_BREAKER_CONSECUTIVE_FAILURES:
+                stopped_early_reason = (
+                    f"{consecutive_failures} mã liên tiếp lỗi -> nghi ngờ API đang lỗi "
+                    f"diện rộng/sập, dừng sớm ở mã {i}/{len(symbols)} thay vì tiếp tục "
+                    "chạy hết danh sách."
+                )
+                log.error(stopped_early_reason)
+                break
 
         if i % 100 == 0:
             log.info(f"Tiến độ: {i}/{len(symbols)} mã đã xử lý...")
 
         time.sleep(THROTTLE_SECONDS)
 
-    fail_ratio = len(failed_symbols) / len(symbols) if symbols else 0
-    if fail_ratio > MAX_FAILED_SYMBOLS_RATIO:
+    attempted = len(all_frames) + len(failed_symbols)
+    fail_ratio = len(failed_symbols) / attempted if attempted else 1.0
+
+    if stopped_early_reason and not all_frames:
         raise RuntimeError(
-            f"{len(failed_symbols)}/{len(symbols)} mã ({fail_ratio:.0%}) lấy company profile "
-            f"thất bại — vượt ngưỡng {MAX_FAILED_SYMBOLS_RATIO:.0%}, nghi ngờ API đang lỗi diện "
-            "rộng. Dừng lại, không ghi file dữ liệu thiếu sót."
+            f"{stopped_early_reason} Và 0 mã lấy được company profile thành công "
+            "trước khi dừng -> dừng hẳn, không ghi CSV."
         )
-    if failed_symbols:
+
+    if fail_ratio > MAX_FAILED_SYMBOLS_RATIO:
+        if stopped_early_reason:
+            log.warning(
+                f"Tỉ lệ lỗi {fail_ratio:.0%} trong {attempted} mã đã thử vượt ngưỡng "
+                f"{MAX_FAILED_SYMBOLS_RATIO:.0%}, nhưng do dừng sớm chủ động nên vẫn "
+                f"ghi {len(all_frames)} mã lấy được thành công."
+            )
+        else:
+            raise RuntimeError(
+                f"{len(failed_symbols)}/{attempted} mã ({fail_ratio:.0%}) lấy company profile "
+                f"thất bại — vượt ngưỡng {MAX_FAILED_SYMBOLS_RATIO:.0%}, nghi ngờ API đang lỗi "
+                "diện rộng. Dừng lại, không ghi file dữ liệu thiếu sót."
+            )
+    elif failed_symbols:
         log.warning(
             f"Có {len(failed_symbols)} mã lấy company profile thất bại (đã bỏ qua): "
             f"{failed_symbols}"
