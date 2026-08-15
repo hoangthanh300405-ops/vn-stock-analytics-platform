@@ -80,13 +80,23 @@ jobs:
         working-directory: dbt_vnstock
         run: dbt seed
 
-      - name: dbt run (chỉ rebuild dim_stock + dim_sector, phần phụ thuộc company_profile)
+      - name: dbt run (rebuild dim_stock + dim_sector VÀ các model staging mà chúng phụ thuộc)
+        # QUAN TRỌNG: dùng "+dim_stock +dim_sector" (có dấu + phía trước),
+        # KHÔNG phải "dim_stock dim_sector" — nếu thiếu dấu +, dbt chỉ build
+        # đúng 2 model này và coi stg_vnstock__company_profile (view mà
+        # dim_stock ref() tới) đã tồn tại sẵn trong file .duckdb rồi, KHÔNG
+        # rebuild lại. Nếu view đó đang là bản CŨ (từ 1 lần dbt run trước đó,
+        # với định nghĩa cột cũ) thì nó cứ dùng mãi định nghĩa cũ dù file .sql
+        # nguồn đã sửa đúng từ lâu -> lỗi "column not found" lặp lại vô tận dù
+        # sửa .sql bao nhiêu lần cũng không hết. Dấu + đảm bảo TẤT CẢ model
+        # thượng nguồn (staging) đều được build lại tươi mới trong CÙNG lần
+        # chạy này, không phụ thuộc trạng thái cũ trong file .duckdb.
         working-directory: dbt_vnstock
-        run: dbt run --select dim_stock dim_sector
+        run: dbt run --select +dim_stock +dim_sector
 
       - name: dbt test
         working-directory: dbt_vnstock
-        run: dbt test --select dim_stock dim_sector
+        run: dbt test --select +dim_stock +dim_sector
 
       - name: Upload file .duckdb mới lên GitHub Release
         if: success()
