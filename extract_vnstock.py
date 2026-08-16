@@ -32,49 +32,28 @@ vnstock/explorer/vci/listing.py và vnstock/explorer/vci/quote.py để đảm b
       -> Gọi lặp qua TỪNG mã (API không có endpoint lấy nhiều mã 1 lần), nên
          cần throttle (nghỉ giữa các lần gọi) để tránh bị chặn IP/rate-limit.
 
-⚠️ FIX SỰ CỐ 2026-08-14 — "Rate Limit Exceeded, Process terminated" từ vnstock:
-   vnstock (gói Community) tự chặn cứng ở 60 request/phút — vượt ngưỡng này,
-   thư viện in cảnh báo rồi THOÁT LUÔN CẢ TIẾN TRÌNH, không phải raise 1
-   Exception bình thường (nghi là SystemExit — kế thừa BaseException, không
-   bị `except Exception` bắt được) -> circuit breaker/time budget cũ KHÔNG
-   cứu được vì script chết trước khi kịp chạy tới đoạn xử lý lỗi.
-   Nguyên nhân: throttle cố định 0.3s/mã cũ cho phép tới ~200 request/phút,
-   gấp hơn 3 lần giới hạn thật. Fix: thay bằng RateLimiter (sliding window,
-   tính CHUNG cho mọi lần gọi API kể cả Listing() và các lần retry) giữ
-   dưới ngưỡng với biên an toàn, + bắt cả BaseException (trừ
-   KeyboardInterrupt) ở vòng lặp per-mã để phòng hờ nếu vẫn lỡ chạm ngưỡng.
+Fix 2026-08-16: LOOKBACK_DAYS=10 trước đây áp dụng ĐỒNG LOẠT cho mọi mã, kể
+cả mã lần đầu xuất hiện trong dim_stock (mới niêm yết, hoặc mới được vnstock
+thêm vào symbols_by_exchange()) -> mã nào niêm yết trước lần đầu tiên
+pipeline này chạy sẽ VĨNH VIỄN chỉ có tối đa 10 ngày giá gần nhất, không bao
+giờ tự vá lại lịch sử cũ hơn (lần chạy nào cũng chỉ lùi đúng 10 ngày).
+-> Trước khi gọi API, đọc file .duckdb đã tải về workspace ở bước trước
+trong daily_etl.yml (bước "Tải file .duckdb của lần chạy trước" chạy TRƯỚC
+bước Extract) để biết mã nào ĐÃ từng có ít nhất 1 dòng giá. Mã nào chưa từng
+có (mã mới) thì lấy lịch sử dài hơn hẳn (BACKFILL_LOOKBACK_DAYS) thay vì chỉ
+LOOKBACK_DAYS ngày — API tự trả về đúng từ ngày niêm yết thật nếu ta xin
+khoảng ngày rộng hơn cả lịch sử thật của mã, không cần biết chính xác ngày
+niêm yết trước.
 
-⚠️ FIX SỰ CỐ 2026-08-13 — "job bị GitHub Actions cancel giữa chừng":
-   trading.vietcap.com.vn đôi khi lỗi diện rộng (hàng loạt mã liên tiếp
-   ReadTimeout 30s). Code cũ không có cơ chế dừng sớm -> mỗi mã lỗi tốn tới
-   ~100s (30s timeout mặc định của thư viện x 3 lần retry + backoff), nhân
-   với hàng trăm mã lỗi liên tiếp -> vượt xa timeout-minutes: 60 của job ->
-   GitHub cancel -> MẤT TRẮNG kể cả phần đã lấy được (vì to_csv() chỉ chạy ở
-   cuối main(), sau khi build_fact_price_daily() return).
-
-   3 cơ chế thêm vào để dứt điểm:
-     1. Hard timeout tầng ứng dụng (HARD_CALL_TIMEOUT_SECONDS) — không phụ
-        thuộc timeout mặc định 30s của thư viện nữa.
-     2. Circuit breaker (CIRCUIT_BREAKER_CONSECUTIVE_FAILURES) — nhiều mã
-        liên tiếp lỗi thì coi là API đang sập diện rộng, dừng sớm thay vì
-        chạy hết danh sách.
-     3. Ngân sách thời gian (MAX_RUNTIME_SECONDS_FACT_PRICE) — tự dừng
-        trước khi chạm timeout-minutes của job, luôn ghi được phần đã lấy
-        thay vì mất trắng.
-   Kèm theo: xoay vòng thứ tự mã theo ngày (_rotate_symbols) để nếu có dừng
-   sớm, các mã bị bỏ sót không phải lúc nào cũng là cùng 1 nhóm ở cuối danh
-   sách — về lâu dài mọi mã đều được thử qua, không có nhóm nào bị bỏ sót
-   vĩnh viễn.
-
-Yêu cầu: pip install vnstock==4.0.5 pandas tenacity (đã pin trong requirements.txt)
+Yêu cầu: pip install vnstock==4.0.5 pandas duckdb tenacity (đã pin trong requirements.txt)
 """
 
-import collections
-import concurrent.futures
 import logging
+import os
 import time
 from datetime import date, timedelta
 
+import duckdb
 import pandas as pd
 from tenacity import retry, stop_after_attempt, wait_exponential
 from vnstock.explorer.vci.listing import Listing
@@ -89,88 +68,33 @@ FACT_PRICE_CSV = "fact_price_daily.csv"
 # Cấp ICB dùng làm cột "industry" — xem giải thích ở docstring phía trên.
 ICB_LEVEL_FOR_INDUSTRY = 2
 
-# Số ngày lấy lùi về trước mỗi lần chạy. Đặt dư ra (không chỉ lấy 1 ngày hôm
-# qua) để tự vá những ngày bị miss do lần chạy trước lỗi/API tạm thời không
-# có dữ liệu, hoặc do circuit breaker/ngân sách thời gian dừng sớm (xem dưới)
-# — trùng lặp với dữ liệu cũ sẽ được dbt dedup ở bước staging (ROW_NUMBER
-# theo symbol+trade_date, xem stg_vnstock__fact_price_daily.sql).
+# Số ngày lấy lùi về trước mỗi lần chạy CHO MÃ ĐÃ CÓ DỮ LIỆU RỒI. Đặt dư ra
+# (không chỉ lấy 1 ngày hôm qua) để tự vá những ngày bị miss do lần chạy
+# trước lỗi/API tạm thời không có dữ liệu — trùng lặp với dữ liệu cũ sẽ được
+# dbt dedup ở bước staging (ROW_NUMBER theo symbol+trade_date, xem
+# stg_vnstock__fact_price_daily.sql).
 LOOKBACK_DAYS = 10
+
+# Số ngày lấy lùi về trước CHO MÃ CHƯA TỪNG CÓ DỮ LIỆU GIÁ (xem Fix 2026-08-16
+# ở docstring). ~10 năm là đủ dài để phủ toàn bộ lịch sử niêm yết của bất kỳ
+# mã nào trên VN — không cần biết chính xác ngày niêm yết, API tự trả về
+# đúng từ ngày mã đó thực sự có giao dịch.
+BACKFILL_LOOKBACK_DAYS = 3650
+
+# Nghỉ giữa mỗi lần gọi API cho 1 mã, để không bị VCI chặn vì gọi quá dồn dập.
+# Với ~1700 mã: 1700 * 0.3s ≈ 8.5 phút, cộng thời gian mạng thực tế mỗi call
+# -> nằm trong ngân sách 20-30 phút đã tính trong daily_etl.yml. Các lần
+# backfill mã mới (ít mã, thường chỉ vài mã/ngày) không ảnh hưởng đáng kể.
+THROTTLE_SECONDS = 0.3
 
 # Số mã lỗi tối đa được phép bỏ qua trước khi coi là API đang có sự cố diện
 # rộng và dừng hẳn (tránh ghi ra 1 file gần như rỗng mà không ai biết).
-# Áp dụng khi vòng lặp CHẠY HẾT danh sách bình thường; nếu dừng sớm vì circuit
-# breaker/ngân sách thời gian thì tỉ lệ lỗi cao là chuyện đương nhiên, không
-# raise nữa (xem build_fact_price_daily).
 MAX_FAILED_SYMBOLS_RATIO = 0.2
-
-# ── Chống "treo cả job hàng giờ" khi API lỗi diện rộng ─────────────────────
-
-# Timeout tầng ứng dụng cho MỖI LẦN gọi Quote.history(), không phụ thuộc
-# timeout mặc định (30s) của thư viện HTTP bên trong vnstock. Nếu 1 lần gọi
-# vượt quá số giây này, coi như lỗi và retry/bỏ qua ngay — không phải chờ đủ
-# 30s như trước.
-HARD_CALL_TIMEOUT_SECONDS = 10
-
-# Nếu có ngần này mã LIÊN TIẾP lỗi, coi như trading.vietcap.com.vn đang sập
-# diện rộng (đúng như log sự cố ngày 13/08: hàng trăm mã liên tiếp
-# ReadTimeout) -> dừng sớm thay vì cắm đầu chạy hết ~1700+ mã còn lại.
-CIRCUIT_BREAKER_CONSECUTIVE_FAILURES = 25
-
-# Ngân sách thời gian tối đa cho riêng bước lấy giá (build_fact_price_daily).
-# job daily_etl.yml có timeout-minutes: 60 cho CẢ job (extract dim_stock +
-# extract giá + load + dbt seed/run/test + upload) -> để dư khoảng 30 phút
-# cho bước lấy giá là hợp lý, phần còn lại (~30 phút) dành cho các bước sau.
-MAX_RUNTIME_SECONDS_FACT_PRICE = 30 * 60
-
-
-class RateLimiter:
-    """Giới hạn tối đa `max_calls` lần gọi trong cửa sổ trượt `period_seconds`
-    giây — tính CHUNG cho MỌI lần gọi API thật (Listing, Quote, kể cả các lần
-    retry), không phải sleep cố định sau mỗi mã như trước.
-
-    Lý do cần sliding window thay vì time.sleep(const) đơn giản: giới hạn
-    thật của vnstock (gói Community) là 60 request/PHÚT tính trên tổng số
-    request, không phải trên số mã đã xử lý — nếu 1 mã phải retry 2 lần thì
-    tính là 2 request. Sleep cố định theo số mã dễ tính thiếu các request
-    phụ này, dẫn tới vẫn chạm ngưỡng dù tưởng đã throttle đủ.
-    """
-
-    def __init__(self, max_calls: int, period_seconds: float):
-        self.max_calls = max_calls
-        self.period_seconds = period_seconds
-        self._call_times: collections.deque = collections.deque()
-
-    def wait(self):
-        now = time.monotonic()
-        while self._call_times and now - self._call_times[0] > self.period_seconds:
-            self._call_times.popleft()
-        if len(self._call_times) >= self.max_calls:
-            sleep_for = self.period_seconds - (now - self._call_times[0]) + 0.05
-            if sleep_for > 0:
-                time.sleep(sleep_for)
-            now = time.monotonic()
-            while self._call_times and now - self._call_times[0] > self.period_seconds:
-                self._call_times.popleft()
-        self._call_times.append(time.monotonic())
-
-
-# Giới hạn thật của vnstock (Community) là 60 request/phút — đặt 45 (biên an
-# toàn ~25%) để chừa chỗ cho các request phụ (Listing() ở đầu, các lần retry)
-# và độ trễ đo thời gian không tuyệt đối chính xác.
-rate_limiter = RateLimiter(max_calls=45, period_seconds=60)
-
-
-def _is_vnstock_hard_rate_limit(exc: BaseException) -> bool:
-    """Nhận diện thông báo 'Rate Limit Exceeded ... Process terminated' đặc
-    trưng của vnstock, để log rõ ràng hơn là lỗi mạng thông thường."""
-    msg = str(exc)
-    return "Rate Limit" in msg or "rate limit" in msg.lower()
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=20))
 def _fetch_symbols_by_exchange() -> pd.DataFrame:
     """Lấy danh sách mã + sàn + tên công ty. Retry vì API vnstock/VCI đôi khi timeout."""
-    rate_limiter.wait()
     log.info("Đang gọi Listing().symbols_by_exchange()...")
     df = Listing().symbols_by_exchange(lang="vi")
     log.info(f"symbols_by_exchange trả về {len(df)} dòng")
@@ -180,7 +104,6 @@ def _fetch_symbols_by_exchange() -> pd.DataFrame:
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=20))
 def _fetch_symbols_by_industries() -> pd.DataFrame:
     """Lấy phân ngành ICB theo mã (dạng dài, nhiều icb_level/mã)."""
-    rate_limiter.wait()
     log.info("Đang gọi Listing().symbols_by_industries()...")
     df = Listing().symbols_by_industries(lang="vi")
     log.info(f"symbols_by_industries trả về {len(df)} dòng (dạng dài, nhiều level/mã)")
@@ -229,60 +152,46 @@ def build_dim_stock() -> pd.DataFrame:
     return dim_stock
 
 
-def _rotate_symbols(symbols: list[str]) -> list[str]:
-    """Xoay vòng thứ tự mã theo ngày trong năm.
-
-    Nếu 1 lần chạy phải dừng sớm (circuit breaker hoặc hết ngân sách thời
-    gian), các mã ở CUỐI danh sách sẽ không được thử tới. Nếu thứ tự luôn cố
-    định, cùng 1 nhóm mã sẽ luôn bị bỏ sót mỗi khi có sự cố -> dữ liệu của
-    nhóm đó có thể thiếu nhiều ngày liền. Xoay vòng theo ngày đảm bảo nhóm bị
-    bỏ sót đổi khác mỗi ngày, về lâu dài mọi mã đều được phủ.
+def _get_symbols_with_existing_price_data() -> set[str]:
     """
-    if not symbols:
-        return symbols
-    offset = date.today().toordinal() % len(symbols)
-    return symbols[offset:] + symbols[:offset]
+    Đọc file .duckdb đã tải về workspace ở bước TRƯỚC bước Extract trong
+    daily_etl.yml (xem step "Tải file .duckdb của lần chạy trước") để biết
+    mã nào ĐÃ từng có ít nhất 1 dòng giá trong raw.fact_price_daily.
 
-
-def _call_with_hard_timeout(fn, timeout_seconds: float):
-    """Chạy fn() với timeout tầng ứng dụng, không phụ thuộc timeout mặc định
-    (30s) của thư viện HTTP bên trong vnstock.
-
-    Chạy trong 1 thread riêng: nếu quá hạn, ta bỏ qua ngay (raise TimeoutError)
-    thay vì chờ tiếp — request gốc có thể vẫn đang chạy ngầm và tự kết thúc
-    sau đó (bị hủy tham chiếu), nhưng ta không còn phải CHỜ nó nữa, đây chính
-    là điểm mấu chốt để không bị treo hàng chục phút khi API lỗi diện rộng.
+    Dùng read_only=True vì Extract và Load (build_duckdb_file.py) không chạy
+    cùng lúc trong 1 job nên không tranh chấp, nhưng tránh lỡ tay ghi nhầm.
+    Trả về set rỗng (coi MỌI mã là mã mới, backfill hết) nếu file chưa tồn
+    tại (lần chạy đầu tiên của cả pipeline) hoặc bảng raw.fact_price_daily
+    chưa từng được tạo — cả 2 trường hợp đều hợp lý để backfill toàn bộ.
     """
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(fn)
+    db_path = os.environ.get("DUCKDB_FILE_PATH", "vnstock.duckdb")
+    if not os.path.exists(db_path):
+        log.info(
+            "Chưa có file .duckdb sẵn từ lần chạy trước -> coi MỌI mã là mã mới, "
+            f"backfill {BACKFILL_LOOKBACK_DAYS} ngày cho tất cả."
+        )
+        return set()
+
     try:
-        return future.result(timeout=timeout_seconds)
-    except concurrent.futures.TimeoutError as e:
-        raise TimeoutError(
-            f"Vượt quá hard timeout {timeout_seconds}s (tầng ứng dụng)"
-        ) from e
-    finally:
-        executor.shutdown(wait=False)
+        con = duckdb.connect(db_path, read_only=True)
+        existing = set(
+            con.execute("SELECT DISTINCT symbol FROM raw.fact_price_daily")
+            .fetchdf()["symbol"]
+            .tolist()
+        )
+        con.close()
+        log.info(f"Đã có dữ liệu giá cho {len(existing)} mã trong file .duckdb hiện tại")
+        return existing
+    except duckdb.CatalogException:
+        log.info("Bảng raw.fact_price_daily chưa tồn tại trong file .duckdb -> coi MỌI mã là mã mới.")
+        return set()
 
 
-@retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=2, min=1, max=6))
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=15))
 def _fetch_ohlcv_one_symbol(symbol: str, start: str, end: str) -> pd.DataFrame:
-    """Lấy giá OHLCV cho ĐÚNG 1 mã. Retry 2 lần (giảm từ 3 — xem ghi chú sự cố
-    ở đầu file), mỗi lần bị chặn bởi HARD_CALL_TIMEOUT_SECONDS thay vì chờ
-    30s mặc định của thư viện.
-
-    LƯU Ý: Quote ở đây là vnstock.explorer.vci.quote.Quote — bản đã gắn sẵn
-    nguồn VCI, __init__ KHÔNG nhận tham số source (khác với class Quote hợp
-    nhất ở top-level `from vnstock import Quote`). Truyền source="VCI" vào
-    đây sẽ bị TypeError ngay lập tức — đã xác nhận bằng inspect.signature().
-    """
-    rate_limiter.wait()
-    return _call_with_hard_timeout(
-        lambda: Quote(symbol=symbol, show_log=False).history(
-            start=start, end=end, interval="1D"
-        ),
-        HARD_CALL_TIMEOUT_SECONDS,
-    )
+    """Lấy giá OHLCV cho ĐÚNG 1 mã. Retry 3 lần vì API hay timeout/lỗi mạng tạm thời."""
+    df = Quote(symbol=symbol, source="VCI").history(start=start, end=end, interval="1D")
+    return df
 
 
 def build_fact_price_daily(symbols: list[str]) -> pd.DataFrame:
@@ -290,121 +199,62 @@ def build_fact_price_daily(symbols: list[str]) -> pd.DataFrame:
     Lặp qua từng mã trong `symbols`, gọi Quote.history(), gộp lại thành 1 bảng
     fact_price_daily: cột symbol, time, open, high, low, close, volume.
 
-    Có 2 cơ chế dừng sớm để không bị treo hàng giờ khi API lỗi diện rộng
-    (xem ghi chú sự cố ở đầu file): circuit breaker theo số mã lỗi liên tiếp,
-    và ngân sách thời gian tối đa. Cả 2 trường hợp đều VẪN ghi ra phần dữ
-    liệu đã lấy được thành công (không mất trắng như code cũ).
+    Mã CHƯA từng có dữ liệu giá (mới niêm yết/mới thêm vào danh sách) được
+    lấy lùi BACKFILL_LOOKBACK_DAYS ngày; mã đã có dữ liệu rồi chỉ lấy lùi
+    LOOKBACK_DAYS ngày như cũ (xem Fix 2026-08-16 ở docstring đầu file).
     """
-    symbols = _rotate_symbols(symbols)
-
     end_date = date.today()
-    start_date = end_date - timedelta(days=LOOKBACK_DAYS)
-    start_str = start_date.isoformat()
+    normal_start_str = (end_date - timedelta(days=LOOKBACK_DAYS)).isoformat()
+    backfill_start_str = (end_date - timedelta(days=BACKFILL_LOOKBACK_DAYS)).isoformat()
     end_str = end_date.isoformat()
 
+    existing_symbols = _get_symbols_with_existing_price_data()
+    new_symbols = set(symbols) - existing_symbols
+
+    if new_symbols:
+        preview = sorted(new_symbols)[:20]
+        log.info(
+            f"Phát hiện {len(new_symbols)} mã CHƯA từng có dữ liệu giá -> backfill từ "
+            f"{backfill_start_str} thay vì chỉ {LOOKBACK_DAYS} ngày gần nhất: {preview}"
+            f"{' ...' if len(new_symbols) > 20 else ''}"
+        )
+
     log.info(
-        f"Lấy giá OHLCV cho {len(symbols)} mã, khoảng {start_str} -> {end_str} "
-        f"(lookback {LOOKBACK_DAYS} ngày, đã xoay vòng thứ tự theo ngày)..."
+        f"Lấy giá OHLCV cho {len(symbols)} mã "
+        f"({len(symbols) - len(new_symbols)} mã cũ: {normal_start_str} -> {end_str}, "
+        f"{len(new_symbols)} mã mới/backfill: {backfill_start_str} -> {end_str})..."
     )
 
     all_frames = []
     failed_symbols = []
-    consecutive_failures = 0
-    stopped_early_reason = None
-    loop_start = time.monotonic()
 
     for i, symbol in enumerate(symbols, start=1):
-        elapsed = time.monotonic() - loop_start
-        if elapsed > MAX_RUNTIME_SECONDS_FACT_PRICE:
-            stopped_early_reason = (
-                f"Đã chạy {elapsed:.0f}s, vượt ngân sách "
-                f"{MAX_RUNTIME_SECONDS_FACT_PRICE}s dành cho bước lấy giá -> dừng sớm "
-                f"ở mã {i}/{len(symbols)} để các bước sau (Load, dbt) còn kịp chạy "
-                "trong timeout-minutes của job."
-            )
-            log.warning(stopped_early_reason)
-            break
-
+        start_str = backfill_start_str if symbol in new_symbols else normal_start_str
         try:
             df = _fetch_ohlcv_one_symbol(symbol, start_str, end_str)
             if df is not None and len(df) > 0:
                 df = df.copy()
                 df["symbol"] = symbol
                 all_frames.append(df)
-            consecutive_failures = 0
-        except KeyboardInterrupt:
-            # Không nuốt Ctrl+C / tín hiệu dừng thật — để job vẫn dừng được
-            # bình thường khi cần (VD người dùng huỷ workflow thủ công).
-            raise
-        except BaseException as e:
-            # Bắt CẢ BaseException (không chỉ Exception) vì thông báo
-            # "Rate Limit Exceeded ... Process terminated" của vnstock nghi
-            # là SystemExit — kế thừa BaseException, KHÔNG bị `except
-            # Exception` bắt được -> nếu chỉ bắt Exception, script sẽ chết
-            # đột ngột ngay tại đây, circuit breaker/time budget phía dưới
-            # không kịp chạy tới. 1 mã lỗi (VD mã đã huỷ niêm yết, mã mới
-            # chưa có giá, hoặc chạm rate limit) không được làm chết cả batch
-            # — log lại và đi tiếp, tổng hợp cảnh báo ở cuối.
+        except Exception as e:
+            # Không để 1 mã lỗi (VD mã đã huỷ niêm yết, mã mới chưa có giá)
+            # làm chết cả job — log lại và đi tiếp, tổng hợp cảnh báo ở cuối.
             failed_symbols.append(symbol)
-            consecutive_failures += 1
-            if _is_vnstock_hard_rate_limit(e):
-                log.error(
-                    f"[{i}/{len(symbols)}] Chạm giới hạn rate-limit CỨNG của vnstock "
-                    f"dù đã qua RateLimiter — dừng ngay lập tức thay vì tiếp tục gọi "
-                    f"(sẽ chỉ chạm lại ngay): {e}"
-                )
-                stopped_early_reason = (
-                    f"Chạm rate-limit cứng của vnstock ở mã {i}/{len(symbols)} — dừng "
-                    "sớm, phần còn lại sẽ được vá ở lần chạy sau (LOOKBACK_DAYS + xoay "
-                    "vòng thứ tự mã)."
-                )
-                break
             log.warning(f"[{i}/{len(symbols)}] Lỗi khi lấy giá {symbol}: {e}")
-
-            if consecutive_failures >= CIRCUIT_BREAKER_CONSECUTIVE_FAILURES:
-                stopped_early_reason = (
-                    f"{consecutive_failures} mã liên tiếp lỗi -> nghi ngờ "
-                    "trading.vietcap.com.vn đang lỗi diện rộng/sập, dừng sớm ở mã "
-                    f"{i}/{len(symbols)} thay vì tiếp tục chạy hết danh sách (tránh "
-                    "treo job cả giờ rồi bị GitHub Actions cancel giữa chừng)."
-                )
-                log.error(stopped_early_reason)
-                break
 
         if i % 100 == 0:
             log.info(f"Tiến độ: {i}/{len(symbols)} mã đã xử lý...")
 
-    attempted = len(all_frames) + len(failed_symbols)
-    fail_ratio = len(failed_symbols) / attempted if attempted else 1.0
+        time.sleep(THROTTLE_SECONDS)
 
-    if stopped_early_reason and not all_frames:
-        # Dừng sớm mà 0 mã lấy được -> API sập hoàn toàn, không ghi file rỗng
-        # đè lên dữ liệu tốt của lần chạy trước.
-        raise RuntimeError(
-            f"{stopped_early_reason} Và 0 mã lấy được giá thành công trước khi dừng "
-            "-> dừng hẳn, không ghi CSV."
-        )
-
+    fail_ratio = len(failed_symbols) / len(symbols) if symbols else 0
     if fail_ratio > MAX_FAILED_SYMBOLS_RATIO:
-        if stopped_early_reason:
-            # Dừng sớm chủ động (circuit breaker/ngân sách thời gian) -> tỉ lệ
-            # lỗi cao trong phần ĐÃ THỬ là chuyện đương nhiên, không raise.
-            # Vẫn ghi phần dữ liệu tốt đã lấy được; phần còn thiếu sẽ được vá
-            # ở các lần chạy sau nhờ LOOKBACK_DAYS + xoay vòng thứ tự mã.
-            log.warning(
-                f"Tỉ lệ lỗi {fail_ratio:.0%} trong {attempted} mã đã thử vượt ngưỡng "
-                f"{MAX_FAILED_SYMBOLS_RATIO:.0%}, nhưng do dừng sớm chủ động nên vẫn "
-                f"ghi {len(all_frames)} mã lấy được thành công."
-            )
-        else:
-            # Chạy hết TOÀN BỘ danh sách bình thường mà tỉ lệ lỗi vẫn cao ->
-            # đúng là API có vấn đề diện rộng, giữ nguyên guard cũ.
-            raise RuntimeError(
-                f"{len(failed_symbols)}/{attempted} mã ({fail_ratio:.0%}) lấy giá thất "
-                f"bại — vượt ngưỡng {MAX_FAILED_SYMBOLS_RATIO:.0%}, nghi ngờ API đang "
-                "lỗi diện rộng. Dừng lại, không ghi file dữ liệu thiếu sót."
-            )
-    elif failed_symbols:
+        raise RuntimeError(
+            f"{len(failed_symbols)}/{len(symbols)} mã ({fail_ratio:.0%}) lấy giá thất bại "
+            f"— vượt ngưỡng {MAX_FAILED_SYMBOLS_RATIO:.0%}, nghi ngờ API đang lỗi diện rộng. "
+            "Dừng lại, không ghi file dữ liệu thiếu sót."
+        )
+    if failed_symbols:
         log.warning(f"Có {len(failed_symbols)} mã lấy giá thất bại (đã bỏ qua): {failed_symbols}")
 
     if not all_frames:
