@@ -48,3 +48,14 @@ models:
         description: Khối lượng giao dịch, không được âm
         tests:
           - not_null
+      - name: reference_price
+        description: >
+          Giá tham chiếu ước tính = giá đóng cửa phiên liền trước (LAG theo symbol).
+          NULL ở dòng đầu tiên trong lịch sử của mỗi mã (chưa có phiên trước để LAG).
+      - name: ceiling_price
+        description: >
+          Giá trần ước tính = reference_price + biên độ theo sàn (HOSE +7%, HNX +10%,
+          UPCOM +15%). Không tính đúng cho phiên đặc biệt (niêm yết mới, sau chia tách).
+      - name: floor_price
+        description: >
+          Giá sàn ước tính = reference_price - biên độ theo sàn, cùng lưu ý như ceiling_price.
