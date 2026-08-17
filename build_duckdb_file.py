@@ -2,8 +2,7 @@
 build_duckdb_file.py
 ----------------------
 Giai đoạn 2 (Load) trong pipeline: nạp dim_stock.csv + fact_price_daily.csv
-(output của extract_vnstock.py) và/hoặc company_profile.csv (output của
-extract_company_profile.py) vào 1 FILE DuckDB TĨNH (không phải MotherDuck).
+(output của extract_vnstock.py) vào 1 FILE DuckDB TĨNH (không phải MotherDuck).
 
 Đổi kiến trúc: MotherDuck free tier giới hạn 10 giờ compute/tháng (chính sách
 mới, khác lúc chọn kiến trúc ban đầu) -> rủi ro demo CV bị gián đoạn giữa tháng.
@@ -18,15 +17,6 @@ vì nguyên tắc CTAS/append/validate giống hệt DuckDB thường):
   - CTAS cho lần load đầu, INSERT...BY NAME cho append
   - Landing vào bảng raw tối giản, chưa transform (dbt lo phần đó)
   - Validate row count ngay sau khi load
-
-⚠️ FIX 2026-08-14: file này được dùng chung bởi 2 workflow riêng biệt —
-   daily_etl.yml (chạy extract_vnstock.py -> có dim_stock.csv +
-   fact_price_daily.csv, KHÔNG có company_profile.csv hầu hết các ngày) và
-   weekly_company_profile.yml (chạy extract_company_profile.py -> chỉ có
-   company_profile.csv, KHÔNG có dim_stock.csv/fact_price_daily.csv).
-   load_dim_stock() và load_fact_price_daily() giờ có guard bỏ qua nếu thiếu
-   CSV tương ứng (giống load_company_profile() đã có sẵn từ trước), để file
-   này chạy được độc lập trong cả 2 workflow mà không cần 2 script Load riêng.
 
 Yêu cầu: pip install duckdb
 Không cần token/secret nào — đây là lợi ích phụ của việc bỏ MotherDuck.
@@ -54,51 +44,12 @@ def get_connection() -> duckdb.DuckDBPyConnection:
 
 
 def bootstrap_schema(con: duckdb.DuckDBPyConnection):
-    """Tạo schema/bảng cần thiết nếu chưa có - idempotent.
-
-    Fix 2026-08-14 (1): raw.company_profile giờ được tạo (rỗng, nếu chưa có)
-    NGAY TỪ ĐÂY, không đợi tới lúc load_company_profile() thấy CSV nữa.
-    Lý do: dim_stock.sql (chạy trong CẢ job daily) join qua
-    stg_vnstock__company_profile.sql, model này SELECT thẳng từ source
-    raw.company_profile — nếu bảng chưa từng tồn tại (VD lần chạy daily đầu
-    tiên sau khi tách weekly_company_profile.yml ra riêng, và weekly chưa
-    kịp chạy lần nào), dbt run sẽ lỗi "Catalog Error: Table ... does not
-    exist" ngay ở model này, dù bản thân job daily không hề cần tới company
-    profile. Bảng rỗng này sẽ bị CREATE OR REPLACE ghi đè bằng dữ liệu thật
-    ngay khi weekly_company_profile.yml chạy lần đầu (xem load_company_profile()).
-
-    Fix 2026-08-14 (2): tên cột của bảng rỗng này ĐÃ ĐƯỢC SỬA cho khớp với
-    danh sách cột THẬT lấy được từ lần chạy weekly đầu tiên (xem giải thích
-    đầy đủ ở đầu file stg_vnstock__company_profile.sql) — company_profile,
-    market_cap, foreigner_percentage — KHÔNG còn business_model/
-    founded_date/charter_capital/number_of_employees như giả định ban đầu,
-    vì các cột đó không tồn tại trong dữ liệu thật.
-    """
+    """Tạo schema nếu chưa có (database đã tạo/USE trong get_connection) - idempotent"""
     con.execute("CREATE SCHEMA IF NOT EXISTS raw")
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS raw.company_profile (
-            symbol VARCHAR,
-            company_profile VARCHAR,
-            listing_date VARCHAR,
-            market_cap VARCHAR,
-            foreigner_percentage VARCHAR
-        )
-    """)
 
 
 def load_dim_stock(con: duckdb.DuckDBPyConnection):
     """dim_stock nhỏ, ít đổi -> full refresh mỗi lần chạy bằng CTAS"""
-
-    # Fix 2026-08-14: file này có thể chạy trong weekly_company_profile.yml
-    # (chỉ có company_profile.csv, KHÔNG chạy extract_vnstock.py) -> bỏ qua
-    # thay vì lỗi nếu không có dim_stock.csv trong lần chạy này.
-    if not os.path.exists(DIM_STOCK_CSV):
-        log.info(
-            f"Không có {DIM_STOCK_CSV} trong lần chạy này (bình thường nếu đây là "
-            "workflow weekly company-profile-only) — bỏ qua."
-        )
-        return
-
     log.info("Đang load dim_stock (full refresh)...")
 
     # Fix #2: kiểm tra CSV có dữ liệu TRƯỚC khi REPLACE, tránh xoá sạch dữ liệu
@@ -122,16 +73,6 @@ def load_dim_stock(con: duckdb.DuckDBPyConnection):
 
 def load_fact_price_daily(con: duckdb.DuckDBPyConnection):
     """fact_price_daily append theo ngày -> tạo bảng nếu chưa có, rồi INSERT"""
-
-    # Fix 2026-08-14: giống load_dim_stock() — bỏ qua nếu chạy trong workflow
-    # weekly company-profile-only, không có fact_price_daily.csv.
-    if not os.path.exists(FACT_PRICE_CSV):
-        log.info(
-            f"Không có {FACT_PRICE_CSV} trong lần chạy này (bình thường nếu đây là "
-            "workflow weekly company-profile-only) — bỏ qua."
-        )
-        return
-
     log.info("Đang load fact_price_daily (append)...")
 
     # Tạo bảng lần đầu nếu chưa tồn tại, dùng đúng schema từ CSV
@@ -160,12 +101,6 @@ def load_fact_price_daily(con: duckdb.DuckDBPyConnection):
 
 def validate(con: duckdb.DuckDBPyConnection):
     """Kiểm tra nhanh sau khi load — không thay cho dbt test ở bước sau, chỉ chặn lỗi thô"""
-
-    tables = {row[0] for row in con.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'raw'").fetchall()}
-    if "fact_price_daily" not in tables:
-        log.info("raw.fact_price_daily chưa tồn tại trong lần chạy này — bỏ qua validate (bình thường ở workflow weekly company-profile-only).")
-        return
-
     log.info("Đang validate dữ liệu vừa load...")
 
     null_symbols = con.execute(
@@ -187,7 +122,7 @@ def validate(con: duckdb.DuckDBPyConnection):
 
 
 def load_company_profile(con: duckdb.DuckDBPyConnection):
-    """company_profile ít đổi -> full refresh, chạy hàng tuần qua weekly_company_profile.yml"""
+    """company_profile ít đổi -> full refresh, chạy hàng tuần (file riêng, không phải mỗi ngày)"""
     if not os.path.exists("company_profile.csv"):
         log.info("Không có company_profile.csv trong lần chạy này (bình thường nếu không phải ngày chạy weekly) — bỏ qua.")
         return
@@ -211,10 +146,23 @@ def load_company_profile(con: duckdb.DuckDBPyConnection):
 def main():
     con = get_connection()
     bootstrap_schema(con)
-    load_dim_stock(con)
-    load_fact_price_daily(con)
-    load_company_profile(con)
-    validate(con)
+
+    # Fix 2026-08-16: thêm biến LOAD_ONLY để weekly_company_profile.yml có thể
+    # gọi lại đúng file này nhưng CHỈ nạp company_profile.csv — job đó không
+    # chạy extract_vnstock.py nên KHÔNG có dim_stock.csv/fact_price_daily.csv
+    # trong workspace, gọi load_dim_stock()/load_fact_price_daily() như cũ sẽ
+    # lỗi "file not found" ngay lập tức. Mặc định (không set biến, dùng cho
+    # daily_etl.yml) giữ nguyên hành vi cũ — nạp đủ cả 3 bảng.
+    only = os.environ.get("LOAD_ONLY", "").strip()
+
+    if only == "company_profile":
+        load_company_profile(con)
+    else:
+        load_dim_stock(con)
+        load_fact_price_daily(con)
+        load_company_profile(con)
+        validate(con)
+
     con.close()
     log.info("Load hoàn tất.")
 
