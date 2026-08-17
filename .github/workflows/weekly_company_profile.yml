@@ -1,22 +1,15 @@
 name: Weekly Company Profile ETL
 
-# Fix 2026-08-14: "Extract company profile" từng bị gộp nhầm vào chung job
-# với daily_etl.yml -> luôn bị GitHub Actions cancel vì riêng bước đó cần
-# TỐI THIỂU ~102 phút (1749 mã x throttle 3.5s) trong khi job daily chỉ còn
-# lại vài chục phút sau "Extract từ vnstock". Tách hẳn ra workflow này, đúng
-# như thiết kế ban đầu ghi trong docstring của extract_company_profile.py.
-
 on:
   schedule:
-    # 20:00 giờ Việt Nam (UTC+7) = 13:00 UTC, tối Chủ nhật hàng tuần — ngoài
-    # giờ chạy của daily_etl.yml (08:45 UTC các ngày trong tuần) để 2 job
-    # không bao giờ overlap thời gian, giảm khả năng phải chờ concurrency lock.
+    # Chủ nhật 20:00 giờ Việt Nam (UTC+7) = 13:00 UTC — ngoài giờ giao dịch,
+    # không trùng với daily_etl.yml (chỉ chạy thứ 2-6 lúc 15:45 giờ VN).
     - cron: "0 13 * * 0"
   workflow_dispatch: {}  # cho phép trigger thủ công để test
 
-# Dùng CHUNG concurrency group với daily_etl.yml vì cả 2 đều đọc/ghi cùng 1
-# file vnstock.duckdb qua GitHub Release — chạy đè lên nhau cùng lúc sẽ làm
-# hỏng file (xem comment gốc trong daily_etl.yml).
+# QUAN TRỌNG: dùng CHUNG group với daily_etl.yml vì cả 2 job đều đọc/ghi
+# đúng 1 file vnstock.duckdb qua GitHub Release "latest-data" — chạy đè lên
+# nhau cùng lúc sẽ làm hỏng file (xem comment gốc trong daily_etl.yml).
 concurrency:
   group: vnstock-data-release
   cancel-in-progress: false
@@ -24,16 +17,15 @@ concurrency:
 jobs:
   etl:
     runs-on: ubuntu-latest
-    # Rộng rãi hơn hẳn daily_etl.yml: riêng throttle 3.5s x ~1749 mã đã cần
-    # ~102 phút TỐI THIỂU dù API không lỗi request nào, cộng thời gian gọi
-    # API thực tế + dbt run/test + để dư biên an toàn cho retry/circuit
-    # breaker trong extract_company_profile.py (MAX_RUNTIME_SECONDS = 150
-    # phút cho riêng bước lấy dữ liệu).
-    timeout-minutes: 180
+    timeout-minutes: 60  # ~1600-1700 mã x throttle delay, tương tự daily_etl.yml
 
     env:
       DUCKDB_FILE_PATH: ${{ github.workspace }}/vnstock.duckdb
       GH_TOKEN: ${{ github.token }}
+      # Chỉ nạp company_profile.csv vào .duckdb — job này KHÔNG chạy
+      # extract_vnstock.py nên không có dim_stock.csv/fact_price_daily.csv
+      # trong workspace (xem nhánh LOAD_ONLY trong build_duckdb_file.py).
+      LOAD_ONLY: company_profile
 
     steps:
       - name: Checkout repo
@@ -58,17 +50,12 @@ jobs:
         run: |
           gh release download latest-data --pattern "vnstock.duckdb" \
             --dir "${{ github.workspace }}" --clobber \
-            || echo "Chưa có file trước đó, workflow daily_etl.yml cần chạy ít nhất 1 lần trước khi weekly chạy lần đầu."
+            || echo "Chưa có file trước đó, sẽ tạo mới ở bước Load."
 
-      - name: Extract company profile
-        env:
-          VNSTOCK_API_KEY: ${{ secrets.VNSTOCK_API_KEY }}
+      - name: Extract company profile từ vnstock
         run: python extract_company_profile.py
 
-      - name: Load company profile vào file DuckDB
-        # build_duckdb_file.py giờ tự bỏ qua dim_stock.csv/fact_price_daily.csv
-        # nếu không tồn tại (xem fix trong file đó) -> chạy an toàn ở đây dù
-        # workflow này không có 2 file CSV đó.
+      - name: Load company_profile vào file DuckDB
         run: python build_duckdb_file.py
 
       - name: Cấu hình dbt profile
@@ -76,30 +63,16 @@ jobs:
           mkdir -p ~/.dbt
           cp dbt_vnstock/profiles.yml ~/.dbt/profiles.yml
 
-      - name: dbt seed (nạp bảng ngày nghỉ lễ VN)
+      - name: dbt run (để dim_stock có company profile mới nạp)
         working-directory: dbt_vnstock
-        run: dbt seed
+        run: dbt run
 
-      - name: dbt run (rebuild dim_stock + dim_sector VÀ các model staging mà chúng phụ thuộc)
-        # QUAN TRỌNG: dùng "+dim_stock +dim_sector" (có dấu + phía trước),
-        # KHÔNG phải "dim_stock dim_sector" — nếu thiếu dấu +, dbt chỉ build
-        # đúng 2 model này và coi stg_vnstock__company_profile (view mà
-        # dim_stock ref() tới) đã tồn tại sẵn trong file .duckdb rồi, KHÔNG
-        # rebuild lại. Nếu view đó đang là bản CŨ (từ 1 lần dbt run trước đó,
-        # với định nghĩa cột cũ) thì nó cứ dùng mãi định nghĩa cũ dù file .sql
-        # nguồn đã sửa đúng từ lâu -> lỗi "column not found" lặp lại vô tận dù
-        # sửa .sql bao nhiêu lần cũng không hết. Dấu + đảm bảo TẤT CẢ model
-        # thượng nguồn (staging) đều được build lại tươi mới trong CÙNG lần
-        # chạy này, không phụ thuộc trạng thái cũ trong file .duckdb.
+      - name: dbt test (data quality gate)
         working-directory: dbt_vnstock
-        run: dbt run --select +dim_stock +dim_sector
-
-      - name: dbt test
-        working-directory: dbt_vnstock
-        run: dbt test --select +dim_stock +dim_sector
+        run: dbt test
 
       - name: Upload file .duckdb mới lên GitHub Release
-        if: success()
+        if: success()  # chỉ publish file mới nếu dbt test pass
         run: gh release upload latest-data "${{ github.workspace }}/vnstock.duckdb" --clobber
 
       - name: Upload CSV làm artifact (debug khi cần)
