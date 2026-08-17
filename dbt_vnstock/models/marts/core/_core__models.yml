@@ -2,7 +2,7 @@ version: 2
 
 models:
   - name: dim_stock
-    description: Dimension mã cổ phiếu — 1 dòng / 1 mã, sàn, ngành
+    description: Dimension mã cổ phiếu — 1 dòng / 1 mã, sàn, ngành, thông tin công ty
     columns:
       - name: stock_key
         description: Khoá chính, trùng với symbol
@@ -12,6 +12,20 @@ models:
       - name: symbol
         tests:
           - not_null
+      - name: market_cap
+        description: Vốn hoá thị trường, đơn vị FULL VNĐ (nguồn Company.overview(), KHÁC đơn vị nghìn đồng của fct_price_daily).
+      - name: business_description
+        description: Mô tả doanh nghiệp dạng text tự do (đổi tên từ cột company_profile của nguồn để tránh trùng tên bảng).
+      - name: foreigner_percentage
+        description: Tỉ lệ sở hữu nước ngoài hiện tại (dạng phân số, VD 0.15 = 15%).
+      - name: maximum_foreign_percentage
+        description: Room ngoại tối đa cho phép (dạng phân số).
+      - name: issue_share
+        description: Số cổ phiếu đang lưu hành.
+      - name: highest_price_1y
+        description: Giá cao nhất 52 tuần theo Company.overview(), đơn vị FULL VNĐ.
+      - name: lowest_price_1y
+        description: Giá thấp nhất 52 tuần theo Company.overview(), đơn vị FULL VNĐ.
 
   - name: dim_sector
     description: Dimension ngành — danh sách ngành duy nhất
@@ -42,6 +56,7 @@ models:
         tests:
           - not_null
       - name: close_price
+        description: Giá đóng cửa, đơn vị NGHÌN đồng (nguồn Quote().history(), KHÁC đơn vị FULL VNĐ của dim_stock.market_cap).
         tests:
           - not_null
       - name: volume
