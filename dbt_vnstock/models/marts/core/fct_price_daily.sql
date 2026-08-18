@@ -2,10 +2,23 @@
 -- Denormalize sector_name + exchange thẳng vào fact (theo khuyến nghị OLAP wide-table)
 -- để dashboard query xu hướng theo ngành/tính biên độ giá không cần join thêm.
 
+-- Fact table: 1 dòng / (mã, ngày). Incremental để không rebuild toàn bộ lịch sử mỗi lần chạy.
+-- Denormalize sector_name + exchange thẳng vào fact (theo khuyến nghị OLAP wide-table)
+-- để dashboard query xu hướng theo ngành/tính biên độ giá không cần join thêm.
+
+-- Fix (phát hiện qua lỗi thật: BinderException "reference_price" not found
+-- khi Streamlit query, dù dbt run luôn báo "Completed successfully"): mặc
+-- định on_schema_change='ignore' của dbt khiến incremental model CHỈ insert
+-- dữ liệu khớp với cột đã có sẵn trong bảng đích, âm thầm bỏ qua bất kỳ cột
+-- mới nào thêm vào SELECT sau khi bảng đã tồn tại (như
+-- reference_price/ceiling_price/floor_price ở fix #9) — không có cảnh báo
+-- nào, rất khó phát hiện. Đặt 'append_new_columns' để dbt tự ALTER TABLE
+-- thêm cột mới ở lần incremental run tiếp theo thay vì âm thầm bỏ qua.
 {{
     config(
         materialized='incremental',
-        unique_key=['symbol', 'date_key']
+        unique_key=['symbol', 'date_key'],
+        on_schema_change='append_new_columns'
     )
 }}
 
@@ -15,7 +28,6 @@ WITH new_prices AS (
     WHERE trade_date >= (SELECT MAX(date_key) FROM {{ this }})
     {% endif %}
 ),
-
 -- Fix #9: reference_price/ceiling_price/floor_price KHÔNG có trong dữ liệu lịch sử
 -- vnstock trả về (đó là thông tin của phiên giao dịch, chỉ price-board realtime mới
 -- có) -> ước tính bằng công thức chuẩn VN: reference = giá đóng cửa phiên liền trước,
