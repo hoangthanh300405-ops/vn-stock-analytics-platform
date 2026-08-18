@@ -20,7 +20,11 @@ on:
 concurrency:
   group: vnstock-data-release
   cancel-in-progress: false
-
+env:
+  DUCKDB_FILE_PATH: ${{ github.workspace }}/vnstock.duckdb
+  GH_TOKEN: ${{ github.token }}
+  LOAD_ONLY: company_profile
+  VNSTOCK_API_KEY: ${{ secrets.VNSTOCK_API_KEY }}
 jobs:
   etl:
     runs-on: ubuntu-latest
