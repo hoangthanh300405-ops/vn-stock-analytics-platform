@@ -1,15 +1,22 @@
 name: Weekly Company Profile ETL
 
+# Fix 2026-08-14: "Extract company profile" từng bị gộp nhầm vào chung job
+# với daily_etl.yml -> luôn bị GitHub Actions cancel vì riêng bước đó cần
+# TỐI THIỂU ~102 phút (1749 mã x throttle 3.5s) trong khi job daily chỉ còn
+# lại vài chục phút sau "Extract từ vnstock". Tách hẳn ra workflow này, đúng
+# như thiết kế ban đầu ghi trong docstring của extract_company_profile.py.
+
 on:
   schedule:
-    # Chủ nhật 20:00 giờ Việt Nam (UTC+7) = 13:00 UTC — ngoài giờ giao dịch,
-    # không trùng với daily_etl.yml (chỉ chạy thứ 2-6 lúc 15:45 giờ VN).
+    # 20:00 giờ Việt Nam (UTC+7) = 13:00 UTC, tối Chủ nhật hàng tuần — ngoài
+    # giờ chạy của daily_etl.yml (08:45 UTC các ngày trong tuần) để 2 job
+    # không bao giờ overlap thời gian, giảm khả năng phải chờ concurrency lock.
     - cron: "0 13 * * 0"
   workflow_dispatch: {}  # cho phép trigger thủ công để test
 
-# QUAN TRỌNG: dùng CHUNG group với daily_etl.yml vì cả 2 job đều đọc/ghi
-# đúng 1 file vnstock.duckdb qua GitHub Release "latest-data" — chạy đè lên
-# nhau cùng lúc sẽ làm hỏng file (xem comment gốc trong daily_etl.yml).
+# Dùng CHUNG concurrency group với daily_etl.yml vì cả 2 đều đọc/ghi cùng 1
+# file vnstock.duckdb qua GitHub Release — chạy đè lên nhau cùng lúc sẽ làm
+# hỏng file (xem comment gốc trong daily_etl.yml).
 concurrency:
   group: vnstock-data-release
   cancel-in-progress: false
@@ -17,7 +24,16 @@ concurrency:
 jobs:
   etl:
     runs-on: ubuntu-latest
-    timeout-minutes: 60  # ~1600-1700 mã x throttle delay, tương tự daily_etl.yml
+    # Fix 2026-08-18: KHÔI PHỤC lại 180 phút — bản trước bị đổi nhầm xuống
+    # 60 phút, gây rủi ro job bị GitHub Actions HARD-KILL giữa chừng (mất
+    # sạch, không ghi được CSV nào) vì riêng throttle 3.5s x ~1749 mã đã cần
+    # TỐI THIỂU ~102 phút dù API không lỗi request nào, cộng thời gian gọi
+    # API thực tế + dbt run/test + để dư biên an toàn cho retry/circuit
+    # breaker trong extract_company_profile.py (chính script đó tự đặt
+    # MAX_RUNTIME_SECONDS = 150 phút, GIẢ ĐỊNH workflow timeout đủ rộng hơn
+    # con số này — 60 phút sẽ làm giả định đó sai, script không kịp tự dừng
+    # an toàn trước khi bị GitHub cancel).
+    timeout-minutes: 180
 
     env:
       DUCKDB_FILE_PATH: ${{ github.workspace }}/vnstock.duckdb
@@ -50,12 +66,15 @@ jobs:
         run: |
           gh release download latest-data --pattern "vnstock.duckdb" \
             --dir "${{ github.workspace }}" --clobber \
-            || echo "Chưa có file trước đó, sẽ tạo mới ở bước Load."
+            || echo "Chưa có file trước đó, workflow daily_etl.yml cần chạy ít nhất 1 lần trước khi weekly chạy lần đầu."
 
-      - name: Extract company profile từ vnstock
+      - name: Extract company profile
         run: python extract_company_profile.py
 
-      - name: Load company_profile vào file DuckDB
+      - name: Load company profile vào file DuckDB
+        # build_duckdb_file.py tự bỏ qua dim_stock.csv/fact_price_daily.csv
+        # nếu LOAD_ONLY=company_profile (xem nhánh trong file đó) -> chạy an
+        # toàn ở đây dù workflow này không có 2 file CSV đó trong workspace.
         run: python build_duckdb_file.py
 
       - name: Cấu hình dbt profile
@@ -63,13 +82,23 @@ jobs:
           mkdir -p ~/.dbt
           cp dbt_vnstock/profiles.yml ~/.dbt/profiles.yml
 
-      - name: dbt run (để dim_stock có company profile mới nạp)
+      - name: dbt seed (nạp bảng ngày nghỉ lễ VN — phòng khi weekly chạy trước daily lần đầu)
         working-directory: dbt_vnstock
-        run: dbt run
+        run: dbt seed
 
-      - name: dbt test (data quality gate)
+      # Fix 2026-08-18: KHÔI PHỤC lại --select dim_stock dim_sector — bản
+      # trước bị đổi thành `dbt run`/`dbt test` KHÔNG scope, vô tình rebuild
+      # cả fct_price_daily (không hề phụ thuộc company_profile, tốn thời
+      # gian dbt run vô ích) và mở rộng bề mặt lỗi: dbt test có thể fail vì
+      # lý do hoàn toàn không liên quan tới company profile, chặn không cho
+      # publish bản .duckdb mới dù company_profile cập nhật tốt.
+      - name: dbt run (chỉ rebuild dim_stock + dim_sector, phần phụ thuộc company_profile)
         working-directory: dbt_vnstock
-        run: dbt test
+        run: dbt run --select dim_stock dim_sector
+
+      - name: dbt test
+        working-directory: dbt_vnstock
+        run: dbt test --select dim_stock dim_sector
 
       - name: Upload file .duckdb mới lên GitHub Release
         if: success()  # chỉ publish file mới nếu dbt test pass
