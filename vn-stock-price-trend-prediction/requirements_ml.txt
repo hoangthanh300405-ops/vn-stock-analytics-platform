@@ -1,0 +1,19 @@
+# Dependencies riêng cho pipeline train_price_trend_model.py — TÁCH khỏi requirements.txt
+# gốc (dùng cho pipeline ETL vnstock hàng ngày) vì đây là job chạy HÀNG TUẦN, khác lịch,
+# và kéo theo các thư viện nặng hơn (lightgbm, optuna, shap) không cần cho ETL.
+#
+# Fix REVIEW_FINDINGS #7: ghim CHẶT ("==", không phải ">=") giống đúng triết lý đã có ở
+# requirements.txt gốc — explain.py từng phải viết code phòng thủ cho 2 dạng trả về khác
+# nhau của shap_values giữa các version shap, bằng chứng cụ thể rằng version trôi tự do
+# ở nhóm thư viện ML còn rủi ro hơn cả vnstock. Nâng version qua PR riêng có kiểm tra thủ
+# công + chạy lại tests/ (xem REVIEW_FINDINGS #8), không dùng "-U" trong production.
+lightgbm==4.7.0
+optuna==4.9.0
+scikit-learn==1.8.0
+shap==0.52.0
+ta==0.11.0
+matplotlib==3.10.8
+duckdb==1.5.5
+pandas==3.0.2
+joblib==1.5.3
+pytest==9.1.1
